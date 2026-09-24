@@ -1,0 +1,113 @@
+# Build and publish the container image.
+#
+# Triggers:
+#   - push to main        -> ghcr.io/<owner>/workbuddy2api-hub:latest (+ :sha-xxxxxxx)
+#   - push a tag v*       -> :1.5.4 / :1.5 (semver, v-prefix stripped) + latest
+#   - PR touching the image sources -> build-only check, nothing is pushed
+#   - workflow_dispatch   -> manual run from the Actions tab
+#
+# Registries:
+#   - GHCR always, via the built-in GITHUB_TOKEN (packages: write) - no setup.
+#     First push creates the package as private; flip it to public under the
+#     repo's Packages settings if anonymous pulls are wanted.
+#   - Docker Hub only when configured: repo VARIABLE `DOCKERHUB_USERNAME`
+#     (Settings > Secrets and variables > Actions > Variables) plus repo
+#     SECRET `DOCKERHUB_TOKEN`. Unconfigured -> the Hub is simply skipped.
+
+name: docker-publish
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "wb_*.py"
+      - "dashboard.html"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+
+# Superseded runs on the same branch/tag are pointless; keep only the newest.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: workbuddy2api-hub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute registry targets
+        id: targets
+        env:
+          DOCKERHUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          {
+            echo "images<<EOF"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}"
+            # Only add the Hub when the owner has opted in; an empty line here
+            # would produce a broken docker.io// image name.
+            if [ -n "$DOCKERHUB_USER" ]; then
+              echo "docker.io/${DOCKERHUB_USER}/${IMAGE_NAME}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request' && vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.targets.outputs.images }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.description=WorkBuddy multi-account reverse proxy gateway
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build (and push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
