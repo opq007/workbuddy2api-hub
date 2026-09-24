@@ -1,8 +1,12 @@
 import re
 import base64
+import functools
+import http.client
 import json
 import os
+import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -31,12 +35,241 @@ _OPENER_CACHE = {}
 _OPENER_LOCK = threading.Lock()
 
 
+# ---- SOCKS dialing (stdlib-only) -------------------------------------------
+#
+# urllib.request.ProxyHandler only speaks HTTP: for https targets it sends a
+# raw "CONNECT host:443" text to whatever host the proxy URL names. A SOCKS
+# server reads that "C" as the protocol version byte, rejects it and resets
+# the TCP connection, which surfaces as "<urlopen error [Errno 104]
+# Connection reset by peer>" - the exact failure of slot tests against
+# socks5:// slots. These helpers implement the RFC 1928 (SOCKS5) and socks4/4a
+# handshakes so slot URLs never get HTTP bytes on a SOCKS port.
+
+_SOCKS_CONNECT_ERRORS = {
+    0x01: "general failure",
+    0x02: "connection not allowed by ruleset",
+    0x03: "network unreachable",
+    0x04: "host unreachable",
+    0x05: "connection refused",
+    0x06: "TTL expired",
+    0x07: "command not supported",
+    0x08: "address type not supported",
+}
+
+_SOCKS_SCHEME_RE = re.compile(r"(?i)^socks(?:[45]a?h?)?://")
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("proxy closed connection during SOCKS handshake")
+        buf += chunk
+    return buf
+
+
+def _socks5_connect(proxy, dst_host, dst_port, timeout=None):
+    """Open a TCP tunnel to (dst_host, dst_port) through a SOCKS5 proxy.
+
+    proxy is (host, port, user, password); credentials may be None. Domain
+    names are passed as ATYP=domain, i.e. resolved by the proxy: a slot pins
+    the exit, so leaking DNS to the local resolver would defeat it. IP
+    literals are sent as literals either way (socks5 and socks5h behave the
+    same for those).
+    """
+    phost, pport, puser, ppwd = proxy
+    sock = socket.create_connection((phost, pport), timeout=timeout)
+    try:
+        methods = b"\x00"
+        if puser is not None:
+            methods += b"\x02"
+        sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        resp = _recv_exact(sock, 2)
+        if resp[0:1] != b"\x05":
+            raise OSError("socks5: unexpected greeting reply %r" % resp)
+        if resp[1:2] == b"\x02":
+            if puser is None:
+                raise OSError("socks5: proxy demands username/password auth")
+            uname = puser.encode("utf-8")
+            pwd = (ppwd or "").encode("utf-8")
+            if len(uname) > 255 or len(pwd) > 255:
+                raise OSError("socks5: username/password too long")
+            sock.sendall(b"\x01" + bytes([len(uname)]) + uname + bytes([len(pwd)]) + pwd)
+            if _recv_exact(sock, 2) != b"\x01\x00":
+                raise OSError("socks5: username/password authentication rejected")
+        elif resp[1:2] != b"\x00":
+            raise OSError("socks5: no acceptable auth method (0x%02x)" % resp[1])
+        try:
+            atyp, addr = b"\x01", socket.inet_aton(dst_host)
+        except OSError:
+            try:
+                atyp, addr = b"\x04", socket.inet_pton(socket.AF_INET6, dst_host)
+            except OSError:
+                atyp = b"\x03"
+                try:
+                    addr = dst_host.encode("ascii")
+                except UnicodeEncodeError:
+                    addr = dst_host.encode("idna")
+        # RFC 1928 framing: ATYP 1/4 addresses are fixed-length; only the
+        # domain form (0x03) carries a 1-byte length prefix.
+        if atyp == b"\x03":
+            addr_field = bytes([len(addr)]) + addr
+        else:
+            addr_field = addr
+        sock.sendall(
+            b"\x05\x01\x00" + atyp + addr_field + struct.pack(">H", dst_port)
+        )
+        ver, rep, _rsv, ratyp = _recv_exact(sock, 4)
+        if ver != 0x05:
+            raise OSError("socks5: bad CONNECT reply version 0x%02x" % ver)
+        if rep != 0x00:
+            reason = _SOCKS_CONNECT_ERRORS.get(rep, "unknown code 0x%02x" % rep)
+            raise OSError("socks5: proxy refused CONNECT: %s" % reason)
+        if ratyp == 0x01:
+            _recv_exact(sock, 6)
+        elif ratyp == 0x03:
+            _recv_exact(sock, 1 + _recv_exact(sock, 1)[0] + 2)
+        elif ratyp == 0x04:
+            _recv_exact(sock, 18)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _socks4_connect(proxy, dst_host, dst_port, timeout=None):
+    """Open a TCP tunnel through socks4/socks4a (userid from the URL, no pwd).
+
+    Wire format: VN CD DSTPORT DSTIP USERID NUL [DOMAIN NUL] - the userid
+    already ends with NUL, so nothing extra may follow it or the relayed
+    stream starts with a stray 0x00 byte.
+    """
+    phost, pport, puser, _ppwd = proxy
+    sock = socket.create_connection((phost, pport), timeout=timeout)
+    try:
+        try:
+            ip4 = socket.inet_aton(dst_host)
+            tail = b""
+        except OSError:
+            # socks4a: placeholder IP 0.0.0.1, hostname after the userid
+            ip4 = b"\x00\x00\x00\x01"
+            try:
+                hostname = dst_host.encode("ascii")
+            except UnicodeEncodeError:
+                hostname = dst_host.encode("idna")
+            tail = hostname + b"\x00"
+        userid = (puser or "").encode("utf-8") + b"\x00"
+        sock.sendall(b"\x04\x01" + struct.pack(">H", dst_port) + ip4 + userid + tail)
+        reply = _recv_exact(sock, 8)
+        if reply[1:2] != b"\x5a":
+            raise OSError("socks4: proxy refused CONNECT (code 0x%02x)" % reply[1])
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _socks_dial(proxy, dst_host, dst_port, timeout=None):
+    if proxy[0] == "socks4":
+        return _socks4_connect(proxy[1:], dst_host, dst_port, timeout)
+    return _socks5_connect(proxy[1:], dst_host, dst_port, timeout)
+
+
+class _SocksHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection whose TCP socket lands on the target via SOCKS."""
+
+    def __init__(self, socks_proxy, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._socks_proxy = socks_proxy
+
+    def connect(self):
+        self.sock = _socks_dial(self._socks_proxy, self.host, self.port, self.timeout)
+
+
+class _SocksHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection: SOCKS tunnel first, TLS to the real target on top."""
+
+    def __init__(self, socks_proxy, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._socks_proxy = socks_proxy
+
+    def connect(self):
+        sock = _socks_dial(self._socks_proxy, self.host, self.port, self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _SocksHTTPHandler(urllib.request.HTTPHandler):
+
+    def __init__(self, socks_proxy, debuglevel=0):
+        super().__init__(debuglevel)
+        self._socks_proxy = socks_proxy
+
+    def http_open(self, req):
+        return self.do_open(functools.partial(_SocksHTTPConnection, self._socks_proxy), req)
+
+
+class _SocksHTTPSHandler(urllib.request.HTTPSHandler):
+
+    def __init__(self, socks_proxy, debuglevel=0, context=None):
+        super().__init__(debuglevel, context=context)
+        self._socks_proxy = socks_proxy
+
+    def https_open(self, req):
+        return self.do_open(
+            functools.partial(_SocksHTTPSConnection, self._socks_proxy),
+            req,
+            context=self._context,
+        )
+
+
+def _parse_socks_proxy(proxy_url):
+    """Split socks4/4a/5(h)://[user:pass@]host[:port] into a dial spec.
+
+    'socks' is treated as socks5 and 'socks5h' as socks5 - both resolve
+    domain names remotely here anyway (see _socks5_connect).
+    """
+    parts = urllib.parse.urlsplit(proxy_url)
+    scheme = (parts.scheme or "socks5").lower()
+    host = parts.hostname
+    port = parts.port if parts.port is not None else 1080
+    if not host:
+        raise ValueError("socks proxy url has no host: %r" % proxy_url)
+    if scheme in ("socks", "socks5", "socks5h"):
+        scheme = "socks5"
+    elif scheme in ("socks4", "socks4a", "socks4h"):
+        scheme = "socks4"
+    user = urllib.parse.unquote(parts.username) if parts.username else None
+    pwd = urllib.parse.unquote(parts.password) if parts.password else None
+    return (scheme, host, port, user, pwd)
+
+
+def _build_socks_opener(proxy_url):
+    """An opener whose requests dial through a SOCKS proxy (no ProxyHandler)."""
+    proxy = _parse_socks_proxy(proxy_url)
+    return urllib.request.build_opener(
+        # Empty ProxyHandler so environment HTTP_PROXY vars cannot intercept.
+        urllib.request.ProxyHandler({}),
+        _SocksHTTPHandler(proxy),
+        _SocksHTTPSHandler(proxy),
+    )
+
+
 def opener_for_proxy(proxy):
     """Build (and cache) a urllib opener bound to one outbound proxy.
 
     Empty/blank means "direct", signalled by None so callers can fall back to
     the process default opener. One opener per account keeps each account's
     traffic pinned to its own exit IP instead of sharing a rotating pool.
+    http/https slots go through urllib's HTTP proxying (CONNECT + basic auth
+    from the URL); socks4/4a/5(h) slots get a real SOCKS dialer, since urllib
+    alone cannot speak SOCKS.
     """
     proxy = str(proxy or "").strip()
     if not proxy:
@@ -44,9 +277,12 @@ def opener_for_proxy(proxy):
     with _OPENER_LOCK:
         opener = _OPENER_CACHE.get(proxy)
         if opener is None:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-            )
+            if _SOCKS_SCHEME_RE.match(proxy):
+                opener = _build_socks_opener(proxy)
+            else:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                )
             _OPENER_CACHE[proxy] = opener
         return opener
 

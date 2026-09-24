@@ -2792,7 +2792,7 @@ function renderProxySlots(){
     + PROXY_SLOTS.map((s, i) =>
         '<tr>'
         + '<td data-label="名称"><input value="' + esc(s.name || '') + '" oninput="PROXY_SLOTS[' + i + '].name=this.value" class="slot-input"></td>'
-        + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" oninput="PROXY_SLOTS[' + i + '].url=this.value" class="slot-input mono"></td>'
+        + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" placeholder="http://user:pass@host:port 或 socks5://user:pass@host:port" oninput="PROXY_SLOTS[' + i + '].url=this.value" class="slot-input mono"></td>'
         + '<td style="text-align:center" data-label="启用"><input type="checkbox" ' + (s.enabled === false ? '' : 'checked')
         +   ' onchange="PROXY_SLOTS[' + i + '].enabled=this.checked"></td>'
         + '<td style="text-align:center" data-label="绑定账号">' + (s.bound || 0) + '</td>'

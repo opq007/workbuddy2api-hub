@@ -204,6 +204,10 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ## 六、版本更新记录 (Changelog)
 
+### 未发布 (Unreleased)
+
+- **修复代理槽位测试报 `<urlopen error [Errno 104] Connection reset by peer>`**：网关此前把所有槽位 URL 都交给 urllib 的 `ProxyHandler`，而 urllib 只会说 HTTP——对 `socks5://` 槽位，它把原始 `CONNECT` 文本直接发到 SOCKS 端口，SOCKS 服务器按 RFC 1928 校验首字节版本号失败后直接 RST，报错看似"代理不可用"，实际代理本身完全正常。现按 scheme 分流：`http(s)://` 槽位维持原有 HTTP 代理路径（CONNECT + URL 内嵌 Basic 认证），`socks5/socks5h/socks4/socks4a` 槽位改走纯标准库实现的 SOCKS 隧道（RFC 1928 握手 + 用户名/密码子协商），域名交由代理端解析（避免本地 DNS 泄露出口关联）。出口 IP 测试同时不再只盯 `api.ipify.org` 单一目标（该域名对部分国内出口会被 GFW 掐断 TLS 造成误报），改为多个回显端点依次回退，失败时聚合报出尝试过的目标。
+
 ### v1.5.4
 
 - **国内版模型目录补上 `hy4-preview-f`**：国内版白名单 `CN_UI_ORDER` 的第一项就是 `hy4-preview-f`，但内置的国内版静态目录里只有同名的旧 id `hy4-preview`（x0.29），它不在白名单里、会被裁剪掉，而 `hy4-preview-f` 本身只能靠本机桌面端缓存补进来。国内版没有国际版那样的上游兜底，所以在没装过国内版桌面端的机器上，国内版列表会少一个、Hy4 preview 直接消失。现按桌面端缓存里的实际条目补进静态目录（x0.00、1M 输入 / 64k 输出、推理档 high）。

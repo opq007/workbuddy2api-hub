@@ -1011,17 +1011,44 @@ def _proxy_port_range():
     return range(17901, 17911)
 
 
+EXIT_IP_ECHO_URLS = (
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://ipinfo.io/ip",
+    "https://myip.ipip.net",
+)
+
+_IPV4_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
 def probe_proxy_exit(proxy_url, timeout=12):
-    """Return (exit_ip, error) for one proxy URL."""
+    """Return (exit_ip, error) for one proxy URL.
+
+    Several IP-echo endpoints are tried in turn: api.ipify.org alone gets its
+    TLS reset mid-handshake by the GFW for some domestic exits, which used to
+    make perfectly working slots fail the panel test with
+    "connection reset by peer".
+    """
     try:
         opener = wb_accounts.opener_for_proxy(proxy_url)
-        if opener is None:
-            return "", "empty proxy url"
-        req = urllib.request.Request("https://api.ipify.org", method="GET")
-        with opener.open(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", "replace").strip(), ""
     except Exception as exc:
         return "", str(exc)[:160]
+    if opener is None:
+        return "", "empty proxy url"
+    errors = []
+    for url in EXIT_IP_ECHO_URLS:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with opener.open(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", "replace").strip()
+            match = _IPV4_RE.search(text)
+            if not match:
+                errors.append("%s: unparsable reply %r" % (url, text[:40]))
+                continue
+            return match.group(1), ""
+        except Exception as exc:
+            errors.append("%s: %s" % (url.split("//", 1)[-1], str(exc)[:90]))
+    return "", "; ".join(errors)[:160]
 
 
 def discover_proxy_slots():
