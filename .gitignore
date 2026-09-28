@@ -24,3 +24,6 @@ desktop.ini
 .idea/
 
 usage/*.bak*
+
+# Local Docker Compose override
+docker-compose.override.yml

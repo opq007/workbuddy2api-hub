@@ -525,6 +525,39 @@ _JSON = r'''
     ]
   },
   {
+    "id": "glm-5.3-flash",
+    "name": "GLM-5.3-Flash",
+    "descriptionEn": "Native multimodal model, excelling at visual understanding and professional tasks",
+    "descriptionZh": "原生多模态模型，擅长视觉理解与专业任务",
+    "credits": "x0.06",
+    "maxInputTokens": 1000000,
+    "maxOutputTokens": 32000,
+    "maxAllowedSize": 1000000,
+    "supportsImages": true,
+    "supportsToolCall": true,
+    "supportsReasoning": true,
+    "onlyReasoning": true,
+    "reasoning": {
+      "canDisableThinking": true,
+      "defaultEffort": "high",
+      "summary": "auto",
+      "supportedEfforts": [
+        "low",
+        "high",
+        "max"
+      ]
+    },
+    "relatedModels": {
+      "lite": "glm-5.3-flash",
+      "reasoning": "glm-5.3-flash"
+    },
+    "temperature": 1,
+    "vendor": "f",
+    "tags": [
+      "craft"
+    ]
+  },
+  {
     "id": "glm-5.2",
     "name": "GLM-5.2",
     "descriptionEn": "1M context, built for long-horizon tasks.",
@@ -579,6 +612,39 @@ _JSON = r'''
     },
     "temperature": 1,
     "vendor": "f"
+  },
+  {
+    "id": "kimi-k2.8-preview",
+    "name": "Kimi-K2.8-Preview",
+    "descriptionEn": "Excels at complex, long-horizon autonomous tasks, with standout front-end skills and strong knowledge work and scientific reasoning",
+    "descriptionZh": "擅长处理复杂的长程自主任务，前端开发能力突出，同时在知识工作与科研推理上表现出色。",
+    "credits": "x0.77",
+    "maxInputTokens": 1000000,
+    "maxOutputTokens": 32000,
+    "maxAllowedSize": 1000000,
+    "supportsImages": true,
+    "supportsToolCall": true,
+    "supportsReasoning": true,
+    "onlyReasoning": true,
+    "reasoning": {
+      "canDisableThinking": true,
+      "defaultEffort": "high",
+      "summary": "auto",
+      "supportedEfforts": [
+        "low",
+        "high",
+        "max"
+      ]
+    },
+    "relatedModels": {
+      "lite": "kimi-k2.8-preview",
+      "reasoning": "kimi-k2.8-preview"
+    },
+    "temperature": 1,
+    "vendor": "f",
+    "tags": [
+      "craft"
+    ]
   },
   {
     "id": "kimi-k2.6",
@@ -1347,7 +1413,7 @@ _CN_JSON = r'''
         1000000
       ]
     },
-    "credits": "x0.03",
+    "credits": "x0.11",
     "descriptionEn": "DeepSeek flagship model, supporting 1M context window, native multimodal model",
     "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口，原生多模态",
     "id": "deepseek-v4.1-flash",

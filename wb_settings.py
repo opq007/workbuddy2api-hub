@@ -293,6 +293,78 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+def reserve_credits(accounts_dir):
+    """Global low-credit guard: an account at or below this balance stays idle.
+
+    Zero disables the guard, which keeps installs that predate the setting
+    behaving exactly as before.
+    """
+    try:
+        value = int(load(accounts_dir).get("reserve_credits") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def set_reserve_credits(accounts_dir, value):
+    """Persist the guard threshold. Returns the stored value."""
+    try:
+        value = int(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    value = max(0, value)
+    with _lock:
+        data = load(accounts_dir)
+        data["reserve_credits"] = value
+        save(accounts_dir, data)
+    return value
+
+
+def auto_switch_product(accounts_dir):
+    """Whether an upstream 429 may rotate an account's outbound identity.
+
+    Off unless the operator turns it on. Rotating identity spends the request's
+    retry budget and leaves the account on a channel nobody picked, so the
+    gateway does not decide that on its own - and an install that predates the
+    setting keeps behaving exactly as it did.
+    """
+    return load(accounts_dir).get("auto_switch_product") is True
+
+
+def set_auto_switch_product(accounts_dir, enabled):
+    """Persist the auto-switch toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["auto_switch_product"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web(accounts_dir):
+    """Whether the intl daily check-in also opens a web-channel conversation.
+
+    On unless the operator turns it off: the desktop-identity chat completion
+    this automation used to send does not register the daily activity, while a
+    web conversation does (issues #75, #59). An install that never touched the
+    setting keeps the web step, because that is the behaviour that earns the
+    credits; the toggle exists so a deployment can opt back into the old
+    single-request check-in.
+    """
+    value = load(accounts_dir).get("daily_chat_web")
+    return True if value is None else value is True
+
+
+def set_daily_chat_web(accounts_dir, enabled):
+    """Persist the web-channel toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")
 
 
