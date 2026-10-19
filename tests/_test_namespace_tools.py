@@ -10,10 +10,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("ACCOUNTS_DIR",
-                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc"))
-os.environ.setdefault("USAGE_DIR",
-                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use"))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. The suite used to point
+# both at tests/_acc and tests/_use, so two runs of it shared one directory and
+# every run left those directories behind in the checkout.
+_TMP = isolated_data_dirs("wb-namespace-tools-")
 
 import wb_proxy as P
 
@@ -105,15 +106,35 @@ check("namespaced tool reaches the chat body",
       "js" in by_name and by_name["js"]["type"] == "function")
 check("namespace map rides along for the return trip",
       chat.get("_namespace_map", {}).get("js") == "node_repl", chat.get("_namespace_map"))
-check("web_search declaration is passed through untouched",
-      any(t.get("type") == "web_search" for t in tools))
 # The gateway used to turn this declaration into a function of its own and run
-# it locally. It no longer does: the upstream has no server-side search tool
-# (measured — declaring one leaves the model answering "I can't browse"), so
-# the gateway forwards what the client sent instead of standing in for it.
-check("the gateway no longer injects its own web_search function",
-      not any((t.get("function") or {}).get("name") == "web_search" for t in tools),
-      tools)
+# it locally, then stopped standing in for it because the upstream has no
+ # server-side search tool at all; standing in for it again is opt-in through
+ # the panel switch (wb_settings.local_web_tools), so this case follows it.
+_orig_local_web = P.wb_settings.local_web_tools
+P.wb_settings.local_web_tools = lambda accounts_dir: False
+try:
+    chat_off = P.responses_to_chat({"model": "m", "input": "hi",
+                                   "tools": [CUSTOM_TOOL, WEB_TOOL, FUNC_TOOL] + NAMESPACES})
+finally:
+    P.wb_settings.local_web_tools = _orig_local_web
+tools_off = chat_off["tools"]
+check("with the switch off the declaration is passed through untouched",
+      any(t.get("type") == "web_search" for t in tools_off), tools_off)
+P.wb_settings.local_web_tools = lambda accounts_dir: True
+try:
+    chat_on = P.responses_to_chat({"model": "m", "input": "hi",
+                                  "tools": [CUSTOM_TOOL, WEB_TOOL, FUNC_TOOL] + NAMESPACES})
+finally:
+    P.wb_settings.local_web_tools = _orig_local_web
+tools_on = chat_on["tools"]
+check("with the switch on it is replaced by the gateway's own function",
+      any(t.get("name") == "web_search" for t in tools_on)
+      and not any(t.get("type") == "web_search" for t in tools_on), tools_on)
+check("only one web_search reaches the chat body",
+      sum(1 for t in tools_on
+          if t.get("type") == "web_search" or t.get("name") == "web_search") == 1,
+      tools_on)
+
 body = P.build_upstream_body(dict(chat))
 up = {t.get("function", {}).get("name"): t for t in body["tools"] if isinstance(t, dict)}
 check("upstream body wraps the flattened tools as chat functions",

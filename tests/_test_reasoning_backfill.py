@@ -17,12 +17,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault(
-    "ACCOUNTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc_rc")
-)
-os.environ.setdefault(
-    "USAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use_rc")
-)
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. The suite used to point
+# both at tests/_acc_rc and tests/_use_rc, so two runs of it shared one directory
+# and every run left those directories behind in the checkout.
+_TMP = isolated_data_dirs("wb-reasoning-backfill-")
 
 import wb_proxy as P
 

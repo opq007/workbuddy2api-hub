@@ -1,11 +1,19 @@
 """Deterministic tests for proxy-slot definitions (no network)."""
 
+import atexit
 import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# One private directory tree, removed when this process exits. It holds the
+# per-section settings/account stores below and the USAGE_DIR the suite hands to
+# wb_proxy, so two runs of it cannot share a directory and a run leaves nothing
+# behind in the checkout.
+_TMP = tempfile.TemporaryDirectory(prefix="wb-slots-")
+atexit.register(_TMP.cleanup)
 
 import wb_settings as S
 
@@ -23,7 +31,7 @@ def check(label, cond, extra=""):
 
 
 print("[1] proxy_slots: empty by default, cleaned on read")
-d = tempfile.mkdtemp(prefix="wb-slots-")
+d = os.path.join(_TMP.name, "default")
 check("no key -> empty list", S.proxy_slots(d) == [])
 
 S.save(
@@ -47,7 +55,9 @@ check(
 check("blank id auto-assigned", slots[1]["id"] == "slot-2", slots[1]["id"])
 check("missing enabled defaults True", slots[1]["enabled"] is True)
 check("name preserved when present", slots[1]["name"] == "auto", slots[1]["name"])
-check("name defaults to id when blank", slots[2]["name"] == "slot-3", slots[2]["name"])
+# A blank name stays blank: the panel labels such a slot by its exit
+# ("美国 住宅") and only falls back to the id when the exit is unknown.
+check("a blank name stays blank", slots[2]["name"] == "", slots[2]["name"])
 check("enabled False preserved", slots[2]["enabled"] is False)
 check("url trimmed", slots[0]["url"] == "http://a:1")
 
@@ -92,7 +102,7 @@ print()
 print("[5] Account: proxySlot persisted, proxy is resolved runtime value")
 import wb_accounts as A
 
-d2 = tempfile.mkdtemp(prefix="wb-slots-acct-")
+d2 = os.path.join(_TMP.name, "account")
 S.set_proxy_slots(d2, [{"id": "slot-1", "name": "one", "url": "http://slot:1"}])
 
 acc = A.Account(
@@ -182,8 +192,8 @@ print()
 print("[8] proxy_slots_view counts only enabled accounts")
 import importlib
 
-os.environ.setdefault("ACCOUNTS_DIR", d2)
-os.environ.setdefault("USAGE_DIR", tempfile.mkdtemp(prefix="wb-slots-use-"))
+os.environ["ACCOUNTS_DIR"] = d2
+os.environ["WB_PROXY_USAGE_DIR"] = os.path.join(_TMP.name, "usage")
 P = importlib.import_module("wb_proxy")
 P.ACCOUNTS_DIR = d2
 P.POOL = pool
@@ -198,18 +208,17 @@ check(
 )
 check("view has url", by_id["slot-2"]["url"] == "http://slot:2")
 
-print()
-print("[9] disabling an account releases its slot")
+print("[9] disabling an account keeps its exit binding (issue #89)")
 pool.set_enabled("u-1", False)
 u1 = pool.get("u-1")
-check("disabled account proxySlot cleared", u1.proxy_slot == "", repr(u1.proxy_slot))
+check("disabled account keeps proxySlot", u1.proxy_slot == "slot-2", repr(u1.proxy_slot))
 check(
-    "disabled account falls back to legacy (not slot)",
-    u1.proxy == "http://legacy:9",
+    "and keeps resolving that slot",
+    u1.proxy == "http://slot:2",
     repr(u1.proxy),
 )
 check(
-    "disabled account no longer counted",
+    "the slot counts only the enabled account as in use",
     {v["id"]: v for v in P.proxy_slots_view()}["slot-2"]["bound"] == 1,
     P.proxy_slots_view(),
 )
@@ -217,14 +226,19 @@ check("enabled account keeps its slot", pool.get("u-2").proxy_slot == "slot-2")
 
 pool.set_enabled("u-1", True)
 check(
-    "re-enabled account starts unbound",
-    pool.get("u-1").proxy_slot == "",
+    "re-enabled account is still on the same exit",
+    pool.get("u-1").proxy_slot == "slot-2",
     pool.get("u-1").proxy_slot,
+)
+check(
+    "and resolves it again",
+    pool.get("u-1").proxy == "http://slot:2",
+    pool.get("u-1").proxy,
 )
 
 print()
-print("[10] load migrates: disabled account holding a slot releases it")
-d3 = tempfile.mkdtemp(prefix="wb-slots-migrate-")
+print("[10] load keeps a disabled account's binding (issue #89)")
+d3 = os.path.join(_TMP.name, "migrate")
 S.set_proxy_slots(d3, [{"id": "slot-1", "name": "one", "url": "http://slot:1"}])
 mig = A.Account(
     {
@@ -240,19 +254,19 @@ pool3 = A.AccountPool(d3, log=lambda m: None)
 pool3.load()
 pool3.apply_proxy_slots()
 m3 = pool3.get("u-mig")
-check("stale slot cleared on load", m3.proxy_slot == "", repr(m3.proxy_slot))
-check("disabled account uses no slot proxy", m3.proxy == "", repr(m3.proxy))
+check("binding survives the load", m3.proxy_slot == "slot-1", repr(m3.proxy_slot))
+check("and the runtime proxy comes from it", m3.proxy == "http://slot:1", repr(m3.proxy))
 reloaded3 = A.AccountPool(d3, log=lambda m: None)
 reloaded3.load()
 check(
-    "cleanup persisted to disk",
-    reloaded3.get("u-mig").proxy_slot == "",
+    "and is still on disk",
+    reloaded3.get("u-mig").proxy_slot == "slot-1",
     reloaded3.get("u-mig").proxy_slot,
 )
 
 print()
 print("[11] selecting direct clears a stale legacy proxy")
-d4 = tempfile.mkdtemp(prefix="wb-slots-direct-")
+d4 = os.path.join(_TMP.name, "direct")
 S.set_proxy_slots(d4, [{"id": "slot-1", "name": "one", "url": "http://slot:1"}])
 stale = A.Account({
     "uid": "u-stale", "domain": "www.workbuddy.ai", "realm": "intl",

@@ -17,8 +17,11 @@ These tests pin the outbound shape so the deletion cannot come back.
 import json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("ACCOUNTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc"))
-os.environ.setdefault("USAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use"))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc and tests/_use with _test_custom_tools.py, which made the two unsafe
+# to run at the same time and left directories in the repo after a run.
+_TMP = isolated_data_dirs("wb-tool-choice-")
 
 import wb_proxy as P
 

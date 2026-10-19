@@ -9,37 +9,14 @@
  *
  *   node _test_matrix_filters.js
  */
-const path = require('path');
-const fs = require('fs');
-const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8');
-const blocks = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = blocks.join('\n');
+const {dashboardScript} = require('./_dashboard_source.js');
+const code = dashboardScript();
 
-const els = {};
-const mk = (id) => (els[id] = els[id] || {
-  id, innerHTML: '', textContent: '', value: '',
-  classList: { add(){}, remove(){}, contains(){ return false; } },
-  style: {}, children: [], focus(){}, blur(){}, click(){},
-  appendChild(c){ this.children.push(c); },
-  querySelectorAll(){ return []; }, querySelector(){ return null; },
-  addEventListener(){}, setAttribute(){}, getAttribute(){ return ''; },
-  insertAdjacentHTML(){}, removeChild(){}, remove(){},
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+dom.installDom({
+  fetch: () => Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) }),
 });
-global.document = {
-  getElementById: (id) => (id ? mk(id) : null),
-  querySelectorAll: () => [], querySelector: () => null,
-  addEventListener: () => {}, createElement: (t) => mk(t + Math.random()),
-  body: mk('body'), head: mk('head'), documentElement: mk('html'),
-};
-global.window = { addEventListener(){}, location:{ href:'' }, matchMedia: () => ({ matches:false, addEventListener(){} }) };
-global.localStorage = { getItem(){return null;}, setItem(){}, removeItem(){} };
-global.sessionStorage = global.localStorage;
-global.fetch = () => Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) });
-global.navigator = { userAgent: 'node' };
-global.setInterval = () => 0; global.clearInterval = () => {};
-global.setTimeout = () => 0; global.clearTimeout = () => {};
-global.location = { href: '', search: '', hash: '' };
-global.alert = () => {}; global.confirm = () => false;
 
 var api;
 try {
@@ -87,11 +64,32 @@ const perf = {
   by_model_acct: {},
 };
 
-// The alternation must be grouped: writing 筛选结果合计|全部模型合计[...]
-// makes the trailing part apply to the second branch only, so the capture is
-// undefined whenever the label is "Filtered" and the check fails spuriously.
-const summaryReq = (o) => { const m = o.match(/(?:筛选结果合计|全部模型合计)[\s\S]*?<td data-label="请求数">([^<]*)</); return m ? m[1] : null; };
-const summaryTok = (o) => { const m = o.match(/<td data-label="总 Token"><b style="color:var\(--accent\)">([^<]*)</); return m ? m[1] : null; };
+/* Read a cell out of the matrix's summary row - the row that carries the
+ * summary label. Anchoring on that row is what keeps the numbers honest: every
+ * data row carries a 总 Token cell of its own, so a cell found anywhere else in
+ * the table must not be able to answer for the summary (issue #58). A cell's
+ * inner markup is presentation, not contract - <b> vs <strong>, how an inline
+ * style is spelled or ordered, an extra attribute on the <td> - so only the
+ * cell's visible text is compared.
+ *
+ * The label stays a grouped alternation: ungrouped, a trailing pattern would
+ * bind to the second branch only, the trap the old summaryReq() called out. */
+const SUMMARY_LABEL = /(?:筛选结果合计|全部模型合计)/;
+function summaryRow(out) {
+  const label = SUMMARY_LABEL.exec(out);
+  if (!label) return null;
+  const start = out.lastIndexOf('<tr', label.index);
+  const end = out.indexOf('</tr>', label.index);
+  return (start < 0 || end < start) ? null : out.slice(start, end);
+}
+function summaryCell(out, label) {
+  const row = summaryRow(out);
+  if (!row) return null;
+  const cell = row.match(new RegExp('<td[^>]*data-label="' + label + '"[^>]*>([\\s\\S]*?)</td>'));
+  return cell ? cell[1].replace(/<[^>]*>/g, '').trim() : null;
+}
+const summaryReq = (out) => summaryCell(out, '请求数');
+const summaryTok = (out) => summaryCell(out, '总 Token');
 let pass = 0, fail = 0;
 const check = (label, cond, extra) => { if (cond) { pass++; console.log('  [PASS] ' + label); } else { fail++; console.log('  [FAIL] ' + label + (extra ? '  ' + extra : '')); } };
 

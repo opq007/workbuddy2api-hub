@@ -255,13 +255,51 @@ def run_checks(filter_name):
         page.screenshot(path=os.path.join(SHOTS, "phone-gateway.png"), full_page=True)
 
         if "nav" in filter_name or filter_name == "":
-            widths = page.evaluate(
-                "Array.from(document.querySelectorAll('.main-nav-btn')).map(b => Math.round(b.getBoundingClientRect().width))"
+            # Tab 数由页面自己决定：智能体配置在服务端 / 远程看板形态下会被整个
+            # 撤掉（issue #246），所以这里一个数量都不写死。要钉的是几何性质：
+            # 标签不被截断、行内容不顶出导航条（摆不下就横向滚动，做法与
+            # .page-nav 一致）、按钮填满整行不留空档。4 个 Tab 放得下时「等宽」
+            # 是这三条的自然结果（issue #150 的属性仍在覆盖范围内）。
+            nav = page.evaluate(
+                """
+                (() => {
+                  const nav = document.querySelector('.main-nav');
+                  const btns = Array.from(document.querySelectorAll('.main-nav-btn'));
+                  const r = nav.getBoundingClientRect();
+                  const hr = document.querySelector('header').getBoundingClientRect();
+                  return {
+                    count: btns.length,
+                    widths: btns.map(b => Math.round(b.getBoundingClientRect().width)),
+                    overflow: Math.round(nav.scrollWidth - nav.clientWidth),
+                    scrollable: getComputedStyle(nav).overflowX !== 'visible',
+                    right: Math.round(r.right),
+                    headerRight: Math.round(hr.right),
+                    clipped: btns.some(b => b.scrollWidth > b.clientWidth + 1),
+                    filled: nav.scrollWidth >= nav.clientWidth - 2,
+                  };
+                })()
+                """
+            )
+            widths = nav["widths"]
+            check(
+                "nav-labels-not-clipped",
+                not nav["clipped"],
+                nav,
             )
             check(
-                "nav-equal-width",
-                len(widths) == 4 and max(widths) - min(widths) <= 2,
-                widths,
+                "nav-stays-inside-the-header",
+                nav["right"] <= nav["headerRight"] + 1,
+                nav,
+            )
+            check(
+                "nav-scrolls-instead-of-overflowing",
+                nav["overflow"] <= 1 or nav["scrollable"],
+                nav,
+            )
+            check(
+                "nav-buttons-fill-the-bar",
+                nav["filled"],
+                (widths, nav["overflow"]),
             )
             nav_w = page.evaluate(
                 "document.querySelector('.main-nav').getBoundingClientRect().width"

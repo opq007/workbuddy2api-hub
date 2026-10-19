@@ -1,0 +1,154 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""workbuddy2api 面板缓存预热器（OpenWrt 版）
+
+面板的统计接口每次缓存过期都要全量重扫 usage.jsonl（2 万行在这台路由器上
+约 12 秒，而且日志在增长）。用户切「今日/本周/本月/全部」时如果正好撞上
+过期，就要干等十几秒——本脚本由 cron 定期把这些贵接口先跑一遍，让缓存
+始终保持热乎，用户点开即是毫秒级。
+
+覆盖：面板会轮询的全部贵接口——/usage 汇总、统计页矩阵（带 range）、
+analytics / timeseries 时间窗、面板自己轮询的 realm 接口（intl/cn）与 by-account，
+外加 /usage/remaining（它自带 15 秒短 TTL，预热的价值是把进程重启后那次冷扫
+挪到面板打开之前）。
+开关：uci workbuddy2api.main.warm（默认 1，设 0 跳过）。
+日志：只在真的重建过（慢）或失败时写 syslog（cron 每 2 分钟一轮，全部命中不写，
+以免刷屏），`logread -e workbuddy2api-warm` 可看。
+"""
+
+import json
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+QUIET = "--quiet" in sys.argv
+
+
+def log(msg):
+    if not QUIET:
+        sys.stdout.write("[warm] %s\n" % msg)
+        sys.stdout.flush()
+    try:
+        subprocess.run(["logger", "-t", "workbuddy2api-warm", msg], timeout=10)
+    except Exception:
+        pass
+
+
+def uci_get(option, default=None):
+    try:
+        out = subprocess.run(["uci", "get", "workbuddy2api.main.%s" % option],
+                             capture_output=True, text=True, timeout=10)
+        value = out.stdout.strip()
+        return value if out.returncode == 0 and value else default
+    except Exception:
+        return default
+
+
+def request(url, data=None, headers=None, timeout=180):
+    req = urllib.request.Request(url, data=data, headers=headers or {})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return resp.status, time.time() - t0
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.read()
+        except Exception:
+            pass
+        return exc.code, time.time() - t0
+    except Exception as exc:
+        return None, time.time() - t0
+
+
+def main():
+    if uci_get("warm", "1") == "0":
+        log("预热已在 uci 里关闭（workbuddy2api.main.warm=0），跳过")
+        return 0
+
+    port = uci_get("port", "8788")
+    password = uci_get("panel_password", "")
+    base = "http://127.0.0.1:%s" % port
+
+    # 面板密码留空时面板用的是默认密码，预热就跳过（避免无谓的失败登录）
+    if not password:
+        log("uci 里没有 panel_password，跳过预热")
+        return 0
+
+    body = json.dumps({"password": password}).encode("utf-8")
+    req = urllib.request.Request(base + "/panel/login", data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            token = json.load(resp).get("token", "")
+    except urllib.error.HTTPError as exc:
+        log("登录失败（http=%s），跳过本轮" % exc.code)
+        return 1
+    except Exception as exc:
+        log("登录出错：%r，跳过本轮" % exc)
+        return 1
+    if not token:
+        log("登录响应里没有 token，跳过")
+        return 1
+
+    headers = {"X-Panel-Token": token}
+    # 面板统计页的轮询接口：/usage 汇总 + 4 个时间窗的 analytics + 4 个时间窗的
+    # timeseries（走势图同样按时间窗缓存）。
+    #
+    # 面板自己轮询的是 VIEW_REALM（默认 intl，可切 cn）而不是 all —— 这几条不预热
+    # 的话，面板闲置一会儿后第一次打开就要等一次全表扫描（实测 3~7s）。
+    targets = [
+        "/usage?realm=all",
+        # 统计页的矩阵表用的是带 range 的这两条（loadAnalyticsMatrix），不预热的话
+        # 「闲置一会儿后第一次切本周/本月」要等一次全表扫描（前端剖析实测 9~11s）。
+        "/usage?realm=all&range=today",
+        "/usage?realm=all&range=week",
+        "/usage?realm=all&range=month",
+        "/usage/perf?realm=all&range=today",
+        "/usage/perf?realm=all&range=week",
+        "/usage/perf?realm=all&range=month",
+        "/usage/analytics?realm=all&range=today",
+        "/usage/analytics?realm=all&range=week",
+        "/usage/analytics?realm=all&range=month",
+        "/usage/analytics?realm=all&range=all",
+        "/usage/timeseries?realm=all&range=today",
+        "/usage/timeseries?realm=all&range=week",
+        "/usage/timeseries?realm=all&range=month",
+        "/usage/timeseries?realm=all&range=all",
+        "/usage?realm=intl",
+        "/usage?realm=cn",
+        "/usage/perf?realm=intl",
+        "/usage/perf?realm=cn",
+        "/usage/by-account",
+        # 剩余用量估算：挂 15 秒短 TTL（WB_REMAINING_TTL），预热的价值主要
+        # 有两处：进程重启后第一次调用要冷扫全量日志建增量折叠（这台路由器
+        # 上约 1~2s），以及把面板每 5 秒一轮的轮询摊薄到一轮重建服务多轮。
+        "/usage/remaining",
+    ]
+
+    slow = []
+    worst = 0.0
+    worst_path = ""
+    for path in targets:
+        code, dt = request(base + path, headers=headers, timeout=300)
+        if code != 200:
+            log("预热 %s 失败 http=%s (%.1fs)" % (path, code, dt))
+            slow.append(path)
+        elif dt > worst:
+            worst, worst_path = dt, path
+    # 正常情况（全部命中、毫秒级）不写 syslog —— cron 每 2 分钟一轮，否则会刷屏；
+    # 只有真的重建了（慢）或失败时才记一行，syslog 里留下的都是有信息量的。
+    if worst >= 1.0 or slow:
+        log("本轮预热完成（%d 个接口，最慢 %.1fs）" % (len(targets), worst))
+    if worst >= 20.0:
+        log("注意：%s 重建耗时 %.1fs，日志变大后该值会继续上升" % (worst_path, worst))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)

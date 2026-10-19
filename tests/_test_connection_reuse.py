@@ -11,6 +11,11 @@ disappear on retry, which is why it is worth a standing test. A raw socket is
 required: an HTTP client library would silently open a fresh connection and
 hide the bug entirely.
 
+Each response is read up to its own boundary instead of being waited for with a
+fixed sleep, so the suite synchronizes on the server's answer rather than on
+machine speed: a correct server on a busy runner used to answer after the sleep
+had already expired, which is indistinguishable from the regression under test.
+
 Starts a real server on a spare port with a throwaway store, so it needs no
 network access and does not touch the real accounts.
 """
@@ -29,6 +34,9 @@ ROOT = os.path.dirname(HERE)          # the gateway lives one level up
 PY = os.path.join(ROOT, "python", "python.exe")
 if not os.path.exists(PY):
     PY = sys.executable
+sys.path.insert(0, HERE)
+
+import _lifecycle as life            # noqa: E402  (spare port + managed process)
 
 PASS = 0
 FAIL = 0
@@ -44,15 +52,94 @@ def check(label, ok, detail=""):
         print("  [FAIL] %s %s" % (label, detail))
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+# How long a complete response may take before the suite calls the server
+# broken. A working gateway answers in milliseconds; the bound exists so a
+# stalled one fails the suite instead of holding the job until the runner's own
+# timeout fires.
+RESPONSE_DEADLINE = 15.0
 
 
-port = free_port()
+class IncompleteResponse(Exception):
+    """The peer closed before the response it had started was complete.
+
+    Kept apart from the deadline: a timeout means the answer is late, this means
+    it will never arrive. Both are failures. The reader is the suite's
+    synchronization point, so a truncated exchange must never be handed back as
+    a finished one - "looks complete" is exactly the reading this suite exists
+    to refuse.
+    """
+
+
+def content_length(head):
+    """The body length the headers declare, or None when they declare none."""
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def read_response(sock, deadline=RESPONSE_DEADLINE):
+    """Read one complete HTTP response off a raw socket, bounded by `deadline`.
+
+    Returns the bytes exactly as they arrived, so the assertions below stay on
+    the wire format. Stops at the response's own boundary - the Content-Length
+    body when the headers declare one, otherwise the close - which is what
+    leaves the connection reusable for the next request. An answer that never
+    completes fails instead of coming back short: TimeoutError when the deadline
+    passes with the peer still open, IncompleteResponse when the peer closes
+    early. Either way the caller never receives a truncated response that could
+    pass for a whole one.
+
+    Chunked framing is deliberately not implemented. The routes under test
+    answer with a Content-Length, and a body with no end must fail loudly
+    instead of being guessed at.
+    """
+    end = time.monotonic() + deadline
+    no_response = "no complete response within %.1fs" % deadline
+
+    def recv(size):
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(no_response)
+        sock.settimeout(left)
+        try:
+            return sock.recv(size)
+        except socket.timeout:
+            # socket.timeout only became an alias of TimeoutError in 3.10 and
+            # the CI floor is 3.9, where recv() raises a class of its own:
+            # normalize it, so one exception type means "the bound was hit".
+            raise TimeoutError(no_response) from None
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = recv(4096)
+        if not chunk:
+            raise IncompleteResponse(
+                "closed after %d bytes, before the header block ended" % len(buf))
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    length = content_length(head)
+    if length is None:
+        # No length: the close ends the body, which is how the 414 path replies.
+        while True:
+            chunk = recv(4096)
+            if not chunk:
+                return head + b"\r\n\r\n" + body
+            body += chunk
+    while len(body) < length:
+        chunk = recv(min(4096, length - len(body)))
+        if not chunk:
+            raise IncompleteResponse(
+                "closed after %d of the %d declared body bytes" % (len(body), length))
+        body += chunk
+    return head + b"\r\n\r\n" + body
+
+
+port = life.free_port()
 work = tempfile.mkdtemp(prefix="connreuse_")
 store = os.path.join(work, "accounts")
 os.makedirs(store)
@@ -60,15 +147,18 @@ with open(os.path.join(store, "settings.json"), "w", encoding="utf-8") as fh:
     json.dump({"api_keys": [{"id": "k1", "name": "t", "key": "GOODKEY",
                              "enabled": True}]}, fh)
 
-proc = subprocess.Popen(
+# Managed spawn: its own group/session, so the stop_managed() in the finally
+# below takes the whole tree - a gateway that leaves a helper behind also leaves
+# its port held.
+proc = life.spawn_managed(
     [PY, os.path.join(ROOT, "wb_proxy.py"), "--port", str(port), "--host", "127.0.0.1",
      "--accounts-dir", store],
     cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
-    env=dict(os.environ, WB_PROXY_USAGE_DIR=os.path.join(work, "usage")),
-)
+    env=dict(os.environ, WB_PROXY_USAGE_DIR=os.path.join(work, "usage")))
 
 
 def wait_ready():
+    """Wait for /health to answer; a gateway that could not bind exits instead."""
     for _ in range(40):
         time.sleep(0.5)
         try:
@@ -93,18 +183,15 @@ def send_pair(bad_body, label):
             b"Authorization: Bearer BADKEY\r\nContent-Type: application/json\r\n"
             b"Content-Length: " + str(len(bad_body)).encode() + b"\r\n\r\n" + bad_body
         )
-        time.sleep(1.0)
-        first = sock.recv(400)
-
+        first = read_response(sock)
         small = b'{"model":"x","messages":[{"role":"user","content":"hi"}]}'
         sock.sendall(
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
             b"Authorization: Bearer GOODKEY\r\nContent-Type: application/json\r\n"
             b"Content-Length: " + str(len(small)).encode() + b"\r\n\r\n" + small
         )
-        time.sleep(2.5)
         try:
-            second = sock.recv(900)
+            second = read_response(sock)
         except Exception as exc:
             second = ("recv error: %s" % exc).encode()
     finally:
@@ -145,9 +232,8 @@ try:
     sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
                  b"Authorization: Bearer GOODKEY\r\nContent-Type: application/json\r\n"
                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
-    time.sleep(2.5)
     try:
-        resp = sock.recv(900)
+        resp = read_response(sock)
     except Exception:
         resp = b""
     sock.close()
@@ -158,9 +244,8 @@ try:
     print("[4] an over-long request line answers JSON, not stdlib HTML")
     sock = socket.create_connection(("127.0.0.1", port), timeout=15)
     sock.sendall(b"GET /" + b"a" * (2 * 1024 * 1024) + b" HTTP/1.1\r\nHost: x\r\n\r\n")
-    time.sleep(2.5)
     try:
-        resp = sock.recv(900)
+        resp = read_response(sock)
     except Exception:
         resp = b""
     sock.close()
@@ -168,12 +253,57 @@ try:
           resp.split(b"\r\n", 1)[0].decode("latin-1", "replace"))
     check("the 414 body is our JSON error shape", b"application/json" in resp,
           resp[:120].decode("latin-1", "replace"))
-finally:
-    proc.terminate()
+
+    # The reader's bound, checked here rather than trusted: a peer that never
+    # answers, and one that stops mid-body, must both fail the read on its
+    # deadline. Without this the deadline could be deleted and every other check
+    # would still pass - on a server that answers.
+    print("[5] the reader's deadline is a bound, not a wait")
+    quiet, silent = socket.socketpair()
     try:
-        proc.wait(timeout=10)
-    except Exception:
-        proc.kill()
+        for stall in ("never answers", "stops mid-body"):
+            if stall == "stops mid-body":
+                silent.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\nhalf")
+            started = time.monotonic()
+            try:
+                read_response(quiet, deadline=0.5)
+                raised = False
+            except TimeoutError:
+                raised = True
+            waited = time.monotonic() - started
+            check("a peer that %s fails the read" % stall, raised)
+            # Loose on purpose: the ceiling only has to separate "gave up" from
+            # "hung", and a loaded runner may be slow to schedule the wakeup.
+            check("and gives up on its deadline, not eventually",
+                  0.5 <= waited < 8.0, "%.2fs" % waited)
+    finally:
+        quiet.close()
+        silent.close()
+
+    # The other half of "never complete": the peer closes early. A truncated
+    # exchange must fail the read rather than come back as a short response that
+    # a caller could take for the whole answer.
+    print("[6] a truncated response fails instead of passing for complete")
+    for truncation, payload in (
+            ("headers", b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"),
+            ("body", b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\nhalf")):
+        quiet, peer = socket.socketpair()
+        try:
+            peer.sendall(payload)
+            peer.close()              # EOF: the rest of the response never comes
+            try:
+                partial = read_response(quiet, deadline=5.0)
+                raised = None
+            except Exception as exc:
+                partial, raised = None, exc
+            check("a response truncated in the %s fails the read" % truncation,
+                  isinstance(raised, IncompleteResponse),
+                  "%s: %r" % (type(raised).__name__ if raised else "returned", partial))
+        finally:
+            quiet.close()
+            peer.close()
+finally:
+    life.stop_managed(proc)
     shutil.rmtree(work, ignore_errors=True)
 
 print()

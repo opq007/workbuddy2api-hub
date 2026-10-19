@@ -14,10 +14,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("ACCOUNTS_DIR",
-                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc"))
-os.environ.setdefault("USAGE_DIR",
-                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use"))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. The suite used to point
+# both at tests/_acc and tests/_use, which it shared with
+# _test_namespace_tools.py, and every run left those directories in the checkout.
+_TMP = isolated_data_dirs("wb-upstream-repairs-")
 
 import wb_proxy as P
 
@@ -166,6 +167,16 @@ check("result order is preserved",
 check("the intruder is kept, only moved",
       any(m.get("content") == "<image_resize_notice>" for m in fixed))
 
+before_first = [{"role": "user", "content": "go"},
+                assistant_with_calls("c0"),
+                {"role": "developer", "content": "<notice>"},
+                tool_result("c0")]
+fixed_bf, changed_bf = P.repack_tool_result_blocks(copy.deepcopy(before_first))
+check("an intruder before the first result is moved", changed_bf)
+check("the result becomes adjacent in that case too",
+      [m.get("role") for m in fixed_bf[1:4]] == ["assistant", "tool", "developer"],
+      [m.get("role") for m in fixed_bf[1:4]])
+
 adjacent = [{"role": "user", "content": "go"},
             assistant_with_calls("c0"),
             tool_result("c0")]
@@ -217,6 +228,126 @@ check("a tool-free conversation is untouched", not changed7)
 check("and keeps its length", len(cleaned4) == 2)
 
 print()
+print("[3b] split parallel batches merge; truncated arguments are dropped")
+
+split_batch = [{"role": "user", "content": "go"},
+               assistant_with_calls("c0"),
+               assistant_with_calls("c1"),
+               tool_result("c0"),
+               tool_result("c1")]
+merged, changed8 = P.merge_adjacent_tool_calls(copy.deepcopy(split_batch))
+check("back-to-back tool_calls batches are reported as a change", changed8)
+check("both calls now ride on one assistant",
+      [tc["id"] for tc in merged[1].get("tool_calls", [])] == ["c0", "c1"],
+      merged[1].get("tool_calls"))
+check("the duplicate assistant is gone",
+      len([m for m in merged if m.get("role") == "assistant"]) == 1)
+
+empty_array = [assistant_with_calls("c0"),
+               {"role": "assistant", "content": [],
+                "tool_calls": assistant_with_calls("c1")["tool_calls"]},
+               tool_result("c0"),
+               tool_result("c1")]
+merged_arr, changed9 = P.merge_adjacent_tool_calls(copy.deepcopy(empty_array))
+check("content: [] counts as empty and merges", changed9)
+check("empty-array batch keeps both calls",
+      [tc["id"] for tc in merged_arr[0].get("tool_calls", [])] == ["c0", "c1"])
+
+reasoned = [{"role": "assistant", "content": None, "reasoning_content": "first",
+             "tool_calls": assistant_with_calls("c0")["tool_calls"]},
+            {"role": "assistant", "content": "",
+             "reasoning_content": "second",
+             "tool_calls": assistant_with_calls("c1")["tool_calls"]}]
+merged_r, changed10 = P.merge_adjacent_tool_calls(copy.deepcopy(reasoned))
+check("reasoning traces are preserved on merge",
+      merged_r[0].get("reasoning_content") == "first\nsecond",
+      merged_r[0].get("reasoning_content"))
+
+text_then_calls = [{"role": "assistant", "content": "",
+                    "tool_calls": assistant_with_calls("c0")["tool_calls"]},
+                   {"role": "assistant", "content": "done"}]
+merged_t, changed11 = P.merge_adjacent_tool_calls(copy.deepcopy(text_then_calls))
+check("a trailing plain assistant folds into the content-less call message",
+      changed11 and merged_t[0].get("content") == "done" and len(merged_t) == 1)
+
+not_empty = [assistant_with_calls("c0"),
+             {"role": "assistant", "content": "kept",
+              "tool_calls": assistant_with_calls("c1")["tool_calls"]}]
+_, changed12 = P.merge_adjacent_tool_calls(copy.deepcopy(not_empty))
+check("a trailing batch with real content is not merged", not changed12)
+
+separated = [assistant_with_calls("c0"),
+             {"role": "user", "content": "hi"},
+             assistant_with_calls("c1")]
+_, changed13 = P.merge_adjacent_tool_calls(copy.deepcopy(separated))
+check("non-adjacent batches are never merged", not changed13)
+
+check("an empty string is a legal no-argument call",
+      not P.is_truncated_arguments(""))
+check("whitespace is a legal no-argument call",
+      not P.is_truncated_arguments("   "))
+check("valid JSON object is complete", not P.is_truncated_arguments('{"a":1}'))
+check("valid JSON scalar is complete", not P.is_truncated_arguments("null"))
+check("half-written JSON is truncated", P.is_truncated_arguments('{"a":'))
+check("plain text is not silently accepted", P.is_truncated_arguments("not json"))
+
+mixed_calls = [{"id": "ok", "function": {"name": "f", "arguments": '{"a":1}'}},
+               {"id": "cut", "function": {"name": "f", "arguments": '{"a":'}},
+               {"id": "noargs", "function": {"name": "f", "arguments": ""}}]
+kept_calls = P.drop_truncated_tool_calls(mixed_calls)
+check("only the truncated call is dropped",
+      [c["id"] for c in kept_calls] == ["ok", "noargs"])
+
+def sse_line(obj):
+    return ("data: " + json.dumps(obj) + "\n\n").encode("utf-8")
+
+
+truncated_stream = [
+    sse_line({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_t", "function": {"name": "f",
+                                                  "arguments": '{"a":'}}]},
+        "finish_reason": "length"}]}),
+]
+agg = P.aggregate_stream(iter(truncated_stream), "m", None)
+check("aggregate_stream drops a truncated call at max_tokens",
+      "tool_calls" not in agg["choices"][0]["message"])
+check("aggregate_stream keeps the length finish reason",
+      agg["choices"][0]["finish_reason"] == "length")
+
+complete_stream = [
+    sse_line({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_c", "function": {"name": "f",
+                                                  "arguments": '{"a":1}'}}]},
+        "finish_reason": "length"}]}),
+]
+agg2 = P.aggregate_stream(iter(complete_stream), "m", None)
+check("aggregate_stream keeps a complete call even at max_tokens",
+      [tc["id"] for tc in agg2["choices"][0]["message"].get("tool_calls", [])] == ["call_c"])
+
+eof_stream = [
+    sse_line({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_e", "function": {"name": "f",
+                                                  "arguments": '{"a":'}}]},
+        "finish_reason": "tool_calls"}]}),
+]
+agg3 = P.aggregate_stream(iter(eof_stream), "m", None)
+check("aggregate_stream drops a truncated call on EOF without [DONE]",
+      "tool_calls" not in agg3["choices"][0]["message"])
+
+resp_stream = [
+    sse_line({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_r", "function": {"name": "f",
+                                                  "arguments": '{"a":'}}]},
+        "finish_reason": "tool_calls"}]}),
+]
+resp_raw = b"".join(P.stream_responses_events(
+    iter(resp_stream), "m", {"usage": None})).decode("utf-8")
+check("stream_responses_events drops the truncated done event",
+      "function_call_arguments.done" not in resp_raw, resp_raw[-400:])
+check("stream_responses_events marks the response incomplete",
+      '"status": "incomplete"' in resp_raw)
+
+print()
 print("[4] integration: build_upstream_body applies the repairs")
 
 broken = {"model": "deepseek-v4.1-flash",
@@ -237,6 +368,20 @@ check("no cache key yet: that is account scoped and added per candidate",
 check("the caller's payload is not mutated",
       len(broken["messages"][1]["tool_calls"]) == 2)
 
+split_body = {"model": "deepseek-v4.1-flash",
+              "messages": [{"role": "user", "content": "go"},
+                           assistant_with_calls("c0"),
+                           assistant_with_calls("c1"),
+                           tool_result("c0"),
+                           tool_result("c1")]}
+built_split = P.build_upstream_body(split_body)
+split_assistants = [m for m in built_split["messages"] if m.get("role") == "assistant"]
+check("a split parallel batch leaves as one assistant",
+      len(split_assistants) == 1, len(split_assistants))
+check("both calls survive the merge",
+      [tc["id"] for tc in split_assistants[0].get("tool_calls", [])] == ["c0", "c1"],
+      split_assistants[0].get("tool_calls"))
+
 print()
 print("[5] prompt_cache_key is off by default")
 
@@ -251,6 +396,23 @@ check("it can be switched on with WB_PROMPT_CACHE_KEY=1",
 _os.environ["WB_PROMPT_CACHE_KEY"] = "0"
 check("and switched back off", P.prompt_cache_key_enabled() is False)
 del _os.environ["WB_PROMPT_CACHE_KEY"]
+
+print()
+print("[6] chat body serialization is compact (official JSON.stringify shape)")
+
+raw = P.encode_upstream_body({"model": "m", "messages": [
+    {"role": "user", "content": "hi"}]})
+check("no whitespace between JSON tokens",
+      raw == b'{"model":"m","messages":[{"role":"user","content":"hi"}]}', raw)
+check("round-trips to the same object",
+      json.loads(raw.decode("utf-8"))["messages"][0]["content"] == "hi")
+check("non-ASCII stays UTF-8 instead of \\u escapes",
+      P.encode_upstream_body({"content": "\u4e2d\u6587"})
+      == b'{"content":"\xe4\xb8\xad\xe6\x96\x87"}',
+      P.encode_upstream_body({"content": "\u4e2d\u6587"}))
+check("compact output is shorter than the old default separators",
+      len(raw) < len(json.dumps({"model": "m", "messages": [
+          {"role": "user", "content": "hi"}]}, ensure_ascii=False).encode("utf-8")))
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))

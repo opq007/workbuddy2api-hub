@@ -12,13 +12,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault(
-    "ACCOUNTS_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc_proxy"),
-)
-os.environ.setdefault(
-    "USAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use_proxy")
-)
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. The suite used to point
+# both at tests/_acc_proxy and tests/_use_proxy, so two runs of it shared one
+# directory and every run left those directories behind in the checkout.
+_TMP = isolated_data_dirs("wb-account-proxy-")
 
 import wb_accounts as A
 
@@ -146,9 +144,9 @@ finally:
 
 print()
 print("[5] AccountPool.set_proxy persists the binding")
-import tempfile
 
-tmpdir = tempfile.mkdtemp(prefix="wbproxy-")
+# Inside the suite's own tree, so this one is removed with it at exit.
+tmpdir = os.path.join(_TMP.name, "pool")
 pool = A.AccountPool(tmpdir, log=lambda m: None)
 pool.add(
     A.Account(
