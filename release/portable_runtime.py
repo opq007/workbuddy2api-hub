@@ -80,6 +80,7 @@ REQUIRED_FILES = (
     "Lib/difflib.py", "Lib/fnmatch.py", "Lib/functools.py", "Lib/getpass.py", "Lib/gzip.py", "Lib/heapq.py",
     "Lib/ipaddress.py", "Lib/queue.py", "Lib/shutil.py", "Lib/random.py",
     "Lib/struct.py", "Lib/subprocess.py", "Lib/threading.py", "Lib/sqlite3/__init__.py",
+    "Lib/posixpath.py", "Lib/signal.py", "Lib/zipfile/__init__.py",
     "Lib/html/__init__.py", "Lib/http/__init__.py", "Lib/http/client.py",
     "Lib/concurrent/__init__.py", "Lib/concurrent/futures/__init__.py",
     "Lib/ctypes/__init__.py", "Lib/collections/__init__.py", "Lib/re/__init__.py",

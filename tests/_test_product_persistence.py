@@ -249,7 +249,7 @@ check("the desktop trace keeps its old shape (no parent span, b3 in three parts)
       (d.get("X-B3-ParentSpanId"), d.get("b3")))
 check("the CN desktop keeps its own version and UA",
       wb_identity.build_identity_headers("workbuddy", "cn", "u1", "tok")["X-IDE-Version"]
-      == "5.5.6")
+      == "5.8.3")
 
 print()
 print("[6b] the CLI identity matches the official CodeBuddy CLI 2.168.2")

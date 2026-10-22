@@ -1,3 +1,98 @@
+## v1.7.24
+
+非 systemd 部署的面板一键更新通道（#561）：`install_enabled()` 不再只认 systemd unit；部署方可以用外部执行者轮询 `request.json`，网关仍只写请求、不碰自己的代码。套件 205 个（153 Python + 52 JS）。
+
+- **外部执行者通道**（#561）：`WB_UPDATE_INSTALL_ENABLED=1` + `WB_UPDATE_REQUEST_DIR` + `WB_UPDATE_EXECUTOR=external`（或目录里的 `executor.json`）即可让面板「安装更新」按钮可用；systemd 路径不变。
+- **`request.json` 扩展**：除 `tag` / `version` / `requested_at` 外，新增 `pid` / `port` / `root`，供外部执行者停进程、探针和替换目录；systemd 执行者忽略额外字段。
+- **参考执行者** `wb_update_external.py`：读取并校验 request（属主 / 权限 / 大小，读完即删），下载 release zip + `SHA256SUMS`，校验后按 manifest 备份 / 替换，停止网关，等 supervisor 拉起，探针 `/health`，失败回滚；启动时如果发现上次状态仍是 `applying` 等活跃状态且有备份，会先自动回滚（供 pre-start hook 使用）。
+- **边界**：只替换 manifest 的 `files`，`accounts/` / `usage/` 不动；应用目录不可写会在下载前报「应用目录不可写」；不替换内置 `python/`。
+- **测试**：`tests/_test_portable_update.py` 扩到 16 项，覆盖外部通道注册、`request.json` 字段、执行者读取 / 删除、无 start 重启模式、半途更新恢复。
+
+## v1.7.23
+
+Windows 便携版支持面板一键更新（#560）：不再要求 systemd unit；面板检测到新版本后，由独立 helper 下载 zip、校验 SHA256SUMS、停服、按 `release-manifest.json` 替换受管文件、重启，失败自动回滚。套件 205 个（153 Python + 52 JS）。
+
+- **便携版一键更新**（#560）：新增 `wb_update_portable.py` 与 `wb_update_apply.py`。`install_enabled()` 在便携包（存在 `release-manifest.json`、`wb_update_apply.py`、`python/python.exe`）里返回 true，面板按钮不再因缺少 systemd unit 而禁用。
+- **更新流程**：下载 `workbuddy2api-hub-vX.Y.Z.zip` 和 `SHA256SUMS` → 校验 → 解包（拒绝 `..` / 绝对路径 / 符号链接）→ 校验 manifest 与 `wb_proxy.py` 版本 → 备份受管文件 → 停止网关 → 替换 → 按原启动模式（静默 / 可见 / LAN）重启 → 轮询 `/health`；失败时恢复备份并重启旧版本。
+- **边界**：只替换 `release-manifest.json` 的 `files`，`accounts/`、`usage/` 等受保护目录不动；不替换内置 `python/` 运行时（运行时升级仍需手动覆盖）；状态写入 `updates/status.json`，面板沿用现有轮询。
+- **测试**：新增 `tests/_test_portable_update.py`（10 项），覆盖 URL / 校验、路径穿越、版本校验、备份 / 替换 / 回滚、helper 启动参数与 bridge 状态；`release/portable.txt` 已加入两个新模块，运行时契约补 `posixpath` / `signal` / `zipfile`。
+
+## v1.7.22
+
+账号任务参与独立开关（#521）：`enabled` 只管 API 取号，新增 `tasksEnabled` 控制签到、成长任务、连登管家、猫猫旅行和国际版每日活跃；停用账号可以只做任务，启用账号也可以不跑任务。套件 204 个（152 Python + 52 JS）。
+
+- **账号任务参与独立开关**（#521）：账号新增 `tasksEnabled`，`enabled` 仍控制 API 取号；调度器的签到 / 成长任务 / 连登管家 / 猫猫旅行 / 国际版活跃改为按 `task_active()` 选号，Token 保活不受影响。手动任务入口（`/tasks`、`/tasks/run`、`/tasks/streak`、`/tasks/travel`、`/accounts/daily-chat`）同样按任务开关过滤；显式指定单个 uid 时仍允许手动执行。
+- **面板「任务开 / 关」胶囊**：账号行新增任务开关，停用但参与任务的账号显示「已停用 · 任务中」；任务卡片和未活跃打卡名单按 `tasksEnabled` 过滤，旧网关没有该字段时回落到 `enabled`。
+- **默认与兼容**：旧账号没有 `tasksEnabled` 时跟随 `enabled`；停用账号默认不跑任务，需要保留任务时在账号行点一下「任务关」变成「任务开」。导出 / 导入会带上该字段。新增 `tests/_test_task_participation.py`（9 项）和 `tests/_test_task_toggle.js`，调度器与打卡名单用例同步覆盖。
+
+## v1.7.21
+
+Windows 便携包补一个可选的前台窗口启动入口：默认仍是静默（pythonw + 日志窗口），需要「关窗即停」时用新的 `start-wb-proxy-visible.bat` / `start-wb-proxy-lan-visible.bat`。套件 202 个（151 Python + 51 JS）。
+
+- **Windows 可选前台窗口启动**（#559）：新增两个薄封装脚本，设置 `WB_LAUNCH_MODE=console` 后调用原启动脚本，走现成的 `:use_python` 可见分支；默认启动方式不变。两个脚本已加入 `release/portable.txt`，并新增 2 项断言（封装脚本设置模式并调用正确目标、主脚本在 pythonw 探测前检查模式）。
+- **README 快速启动说明**：Windows 默认静默启动，关掉日志窗口不会停服务；需要「前台控制台 + 关窗即停」时用 `-visible.bat`；局域网一节同步补上。
+
+## v1.7.20
+
+三处回归修复：裸对象账号导入、流式断流错误帧与打印工具调用延迟、热力图跨天不刷新。套件 202 个（151 Python + 51 JS）。
+
+- **修复 `/accounts/import` 拒绝裸 snake_case 账号对象**（#556）：外层容器判断只认 `accessToken`，单个 cockpit 导出的 `{"uid": ..., "access_token": ...}` 在到达内层 snake_case 转换前就被 400 拒绝；补上 `access_token` 判断后，裸对象与 `{"accounts": [...]}` 的行为一致。新增 2 项断言。
+- **流式断流不再伪造 `[DONE]`**（#549）：Chat Completions 与 Responses 在读 body 中途失败时，原来补一个 `data: [DONE]` 当作正常结束，客户端会把截断的答案当成完整回复；现在先释放已缓冲文本，再发标准 error 帧（`upstream_stream_error`）并关闭连接，不再发送 `[DONE]`。新增真实网关回归 `tests/_test_stream_abort_frame.py`（6 项）。
+- **打印式工具调用即时释放**（#549）：`LeakedToolCallStreamFilter` 原来从候选前缀开始一直扣留到 EOF，长工具调用会让客户端长时间没有输出、最后一次性弹出；现在识别到调用自身的闭合标签（含全角 DSML 写法）就立即解析并发出，调用后的散文也立即释放，只有仍可能长成调用的文本留在缓冲里。新增 4 项断言。
+- **热力图按本地日刷新**（#541）：工作回溯热力图原来只在进页面时取一次 366 天序列，跨过午夜后仍停在旧的一天；现在 `since` / `until` 都钉在本地午夜（`until` 取到明天 0 点），进页面、跨天或距上次取数满 60 秒时重取，今天新产生的用量会落进今天的格子。新增 `tests/_test_dashboard_heat.js`（8 项断言）。
+
+## v1.7.19
+
+网页活跃链路成组升级、Key 级账号白名单与模型可用性过滤：本版收下社区 12 个 PR（#542–#554），把国际版每日活跃的时段、并发、重试、去重、模型回退与提示词都做成可配置项，并补上 Key 级账号限制、思考档位映射、全局提示词在线编辑、出站身份版本面板和身份句动词收口。套件 200 个（150 Python + 50 JS）。
+
+- **网页活跃可单独定时（分钟级）**（#548）：`schedule.daily_chat` 支持 1–24 个 `HH:MM` 时段，留空保持跟随签到整点；到点只触发国际版每日活跃，不再顺带跑签到 / 旅行 / 保活；设置页可逐个增删时间点，改完 30 秒内生效。
+- **网页活跃并发数（默认 1）**（#552）：新增 `daily_chat_web_concurrency`（1–10）。巡检先收集当天未活跃的国际版账号，再按上限并发执行；worker 启动带轻微错峰，调度日志加锁，多 worker 同时写不丢行。
+- **当日活跃成功后不再重复网页活跃**（#553）：`lastDailyChat` 已是今天时，`daily_chat()` 与 `daily_chat_web()` 直接返回 `skipped`，不再发桌面腿或新建网页会话；覆盖多个定时点、手动补跑与并发触发。
+- **网页活跃重试改为线性递增**（#551）：第 N 轮等待从 `base × 2^(N-1)` 改为 `base × N`，默认 3 次由 120 / 240 / 480 秒变为 120 / 240 / 360 秒，最坏占用从指数级降到线性级。
+- **网页活跃失败后按模型组合回退（默认关闭）**（#543）：按目录倍率排序（免费 → 低积分 → 高积分）逐个换模型，候选至少各试一次；建会话被业务拒绝时仍立即停止，不换模型。
+- **网页活跃随机提示词（默认关闭）**（#545）：开启后从内置 300 条短句加最多 200 条自定义提示词里随机抽一条；关闭时仍只发 `Hi`。设置页弹窗支持搜索、全选与逐条复选。
+- **API Key 支持允许账号白名单**（#544）：Key 新增 `accounts`，调度器只从名单内取号，会话粘性绑定不能绕过，`/u/<ref>` 定址到名单外账号返回 403；留空保持不限制，旧 Key 行为不变。
+- **只列出可用模型（默认关闭）**（#546）：`/v1/models` 只返回池里至少有一个账号能服务的模型；国际版 PRO ONLY 模型只有在池里存在付费账号时才列出，`ready()` 同时拒绝把它派给免费账号。
+- **思考档位映射（默认开启）**（#542）：请求的 `reasoning_effort` 不在模型目录声明的档位里时，改写为默认档位（`defaultEffort` → 固定档位 → 支持列表首项）；目录声明 `canDisableThinking: false` 时 `off` / `none` 也回落。可关闭后原样透传。
+- **全局提示词支持面板在线编辑**（#547）：`prompt.text` 优先于原有的 `prompt.file`，可选追加到 system 或替换 system，保存后即时生效，不必再往容器里挂文件；默认透传不改写。
+- **出站身份版本号可查看与修改**（#554）：面板列出 WorkBuddy 国际 / 国内、桌面内置 CLI、VSCode、CodeBuddy CLI、SDK 与 Node 的当前值和默认值，修改必须输入面板密码。国内版桌面端按 Go 版 2026-10-18 实跑对齐到 5.8.3 / CLI 2.161.0。
+- **11-128 身份句动词搭配补全**（#550）：动词表从 `powered by` / `built on` 两种扩到 7 种（`built by` / `created by` / `developed by` / `made by` / `trained by` 与省略名词的 `You are powered by …`），不引入新判据；`You are free to use tools built by …` 这类分词修饰宾语的句子保持不改写。
+
+## v1.7.18
+
+11-128 身份句指纹、积分刷新崩溃、无畏契约任务与两处面板修复：本版把「客户端自我介绍句式 + 品牌」这一类渠道指纹从单句扩展到通用句式，并收了积分批量刷新、任务清单和面板文案/布局的几处回归。套件 189 个（139 Python + 50 JS）。
+
+- **11-128：身份句 + 品牌的组合指纹改为中性句**（#533 / #537 / #539）：上游对 `You are an AI agent powered by DeepSeek Harness.`、`You are a coding agent powered by the deepseek-v4.1-flash model.`、`You are an AI assistant built on DeepSeek.` 这类「自我介绍句式 + 品牌」做大小写不敏感的连续子串匹配，命中即 400 / code 11-128；单独品牌词、改词或去掉句式都放行。现在把 system / developer 里的这类整句改写为 `You are a helpful AI assistant.`，不依赖具体品牌；user / assistant / tool 里的同名文本保持原样（用户数据）。`has_fingerprint()` 的小写快路径同步补齐，新增 12 项单测。
+- **修复全量刷新积分在默认间隔下崩溃**（#530）：`_credits_sweep()` 使用 `random.uniform(0.8, 1.2)` 做账号间拟人间隔，但 `wb_proxy.py` 漏了 `import random`，多账号点「一键刷新积分」会以 `NameError` 中断；单账号与 `WB_CREDITS_SWEEP_GAP_MS=0` 不受影响。补上导入并新增回归测试。
+- **成长任务补充「无畏契约拼豆专家」**（#525）：`WorkBuddy_Valorant` 登记为专家任务，事件固定使用真实专家 id `ex_xQHHD1u5Jkua`，不再走通用专家池；一键做任务时自动推进并领奖。
+- **修复「数据用途声明」文案反了**（#528）：`X-Private-Data` 是「数据私有」声明，`true` = 不参与模型优化、`false` = 允许参与；下拉选项与英文词条此前正好相反。已交换两处文案并加 4 项断言。
+- **修复模型清单「消费倍率」列截断**（#527）：带「免费账号不可用」胶囊的行在 1366/1440/1512 宽度下被 `nowrap` 裁掉第二枚胶囊；该列改用 `rate-cell` 类允许换行，不再依赖会被 i18n 翻译的 `data-label` 选择器。
+- **测试：聚合缓存节流用例改为统计写盘调用**（#526）：exFAT 的 mtime 粒度粗，内容相同的重写与「没有写」在文件上看不出区别；用例改为计数 `_usage_cache_write_kind` 的 snapshot 调用，断言不变。
+
+## v1.7.17
+
+流式断流重试与出口退避、模型级 5xx 不熔断、Codex 一键配置、积分与估价口径、成长任务手动领取、免费账号不可用标注：本版把「断流被伪装成正常结束」「模型错误拖垮整池」「关限额不生效」这几条长尾问题一起收了，并补上几个新能力。套件 188 个（139 Python + 49 JS）。
+
+- **流式断流：首字节前重开一次，出口按读完记账**（#522）：`open_upstream` 拿到响应头就返回，`IncompleteRead` 发生在读 body 时，回不到重试循环；chat 路径还会补一个 `[DONE]` 当作正常结束。现在 `emitted=False`（客户端一个字节都没收到）时在同一账号、同一出口上重开一次，递归复用已经发出的响应头；`iter_sse_lines` 对 Content-Length 提前 EOF 补抛 `IncompleteRead`。出口维度的成功记账从「拿到响应头」挪到「流读完」：断流记 transient，重试成功不抵消，干净的流才清零。`/v1/responses` 的读流重试仍待后续。
+- **模型级 5xx 不再熔断整池**（#499）：`11134` / `11102` / `11150` / `11158` / `11129` 等错误先解析上游 body 的 `code`；命中时只停手并把上游 500 原样返回，不再给账号记 fails / 熔断。普通 500 仍按账号故障处理；`WB_MODEL_SCOPED_ERRORS_PENALIZE=1` 可恢复旧行为。
+- **关闭日限额立即生效**（#519）：账号上的 `daily_*` 限额只活在内存里，原来在全部为 0 时不会推送，导致关掉限额后账号仍保留旧值。现在设置保存路径会把三条护栏无条件推一次（值为 0 也推），请求热路径保持原契约。
+- **Codex 一键配置改用内联 bearer token**（#513）：Codex 0.163 启动时解析 `env_key`，GUI 未继承 `OPENAI_API_KEY` 就直接报 `Missing environment variable`；`auth.json` 不再兜底。provider 表改为直接写 `experimental_bearer_token`，并移除旧的 `env_key` / `env_key_instructions`。
+- **X-Private-Data 可由设置选择**（#516）：设置页新增「数据用途声明」，`auto` 保持三套身份原取值，显式 `true`/`false` 对 WB / VSCode / CLI 都覆盖；非法值返回 400。
+- **积分包到期显示统一按 no_expiry**（#474）：体验版 / 免费包的 `CycleEndTime` 只是每月计费边界，后端已按 `DeductionEndTime` 标成 `no_expiry`；前端表格此前仍拿周期结束算倒计时，出现「表里剩 12 天、最近到期卡片却不认」。现在表格与卡片都显示「长期有效」，套餐列表默认筛成「有剩余」。
+- **OpenRouter 估价可按模型校准**（#514）：`usage/pricing-markup.json` 支持 `{模型: 系数}`，估算金额乘以该系数，便于把 OR 的 top-provider 参考价校准到官方价；缺失、损坏或非正数按 1.0，策略历史不改写。
+- **成长任务支持手动领取**（#507）：任务区新增「自动领取」复选框（默认开）。取消后「一键做任务」只推进进度，任务停在「待领奖」，可在任务表按账号逐个领取；新增 `POST /tasks/claim`。
+- **模型清单标出「免费账号不可用」**（#505，运行时部分）：上游 11158 时写入 `accounts/model_entitlements.json`，同一 `(realm, model)` 后续成功请求自动撤标，`11102` / `11134` 不记；`/v1/models` 每条带 `entitlement` 字段，面板显示「免费账号不可用」胶囊，24 小时后自动过期。刷新清单时的主动探测仍待采样口径。
+- **一键部署区分 local / lan / public**（#512）：新增 `WB_DEPLOY_MODE`，默认 `lan` 保持原行为；`local`/`public` 只把宿主 8788 绑到 `127.0.0.1`，公网机需要再套反向代理。已有部署不自动改写 compose。
+- **排程只在自己的配置小时执行**（#515）：此前命中任意一个配置小时就会把签到、活跃、猫猫旅行、连登和保活一起跑；现在每个任务只在自己的小时执行，面板「立即执行」仍会强制跑完整轮。
+- **吞吐量改用 completion tokens**（#509）：Token 时序图的吞吐量、峰值与悬停都改用 `completion_tokens`，标签改为「输出 tok/s」；Token 总量仍显示 `total_tokens`。
+- **只有 reasoning 的回复改为 failed**（#508）：上游把整轮预算花在 reasoning 上、正文为空时，流式发 `response.failed`，非流式返回 502，不再伪装成 completed；新增 `WB_DEFAULT_REASONING_EFFORT`。
+- **区块导航不再把按钮文字算进标题**（#517）：「网关模型清单」标题里的全选 / 全不选 / 反选按钮不再混进导航项与锚点 id。
+- **DSH 一键配置直写 profile 补丁层**：只替换 `wb-proxy` 段，保留其它 provider 与注释；放宽 `wb-proxy` 的限流重试，修掉「对话到一半链接中断」。
+- **网关模型清单可勾选**：每行模型 ID 前新增复选框，默认全部勾选，表头带「全选 / 全不选 / 反选」；只有勾选的模型才会写进 DSH / OpenCode / Crush / ZCode 的模型清单。
+- **移动端布局修复**：KPI 对比百分比、账号卡版本与状态徽章、今日活动标签、打卡按钮、积分格「明细」按钮等窄屏错行一并修正。
+- **面板与日志出口统一脱敏手机号**：面板 JSON、日志看板、stderr、`/logs/export` 与账号导出统一掩码 11 位手机号，不误伤订单号与时间戳。
+- **全量刷积分加并发与节奏护栏**：整池刷新加 CAS 单飞与账号间 800~1200ms 随机间隔，避免前端每 15 秒重试把上游打满。
+
 ## v1.7.16
 
 国内版上游可改址、面板稳定性与英文界面修复：新增 WB_CN_CHAT_UPSTREAM，海外出口可把国内版对话 / 刷新 / 任务一起切到 www.workbuddy.cn（#465）；修复空数据时 Token 时序悬停崩溃、英文界面词级拼接、区间切换串号与轮询 304 不命中（#470）。套件 172 个（127 Python + 45 JS）。

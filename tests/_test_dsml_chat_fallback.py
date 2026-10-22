@@ -137,6 +137,20 @@ check("prose ahead of a call in one delta is released",
 out5b = f5.flush()
 check("that call converts too", bool(out5b) and out5b[0][0] == "calls", out5b)
 
+print("[4b] a complete call is released without waiting for EOF (#549)")
+f6 = P.LeakedToolCallStreamFilter()
+out6 = f6.feed(HYBRID)
+check("a complete call converts on arrival",
+      len(out6) == 1 and out6[0][0] == "calls", out6)
+check("nothing is left buffered", f6.buf == "", f6.buf)
+
+f7 = P.LeakedToolCallStreamFilter()
+out7 = f7.feed("look: " + HYBRID + " done")
+check("prose before and after a complete call is kept",
+      [a[0] for a in out7] == ["text", "calls", "text"], out7)
+check("the trailing prose is intact",
+      out7 and out7[-1] == ("text", " done"), out7)
+
 
 def sse(payload):
     return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")

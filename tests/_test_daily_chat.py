@@ -276,7 +276,7 @@ class WebChannelTests(unittest.TestCase):
 
     # ---- 失败重试 ----------------------------------------------------------
     # 一轮「会话还没跑完」往往只是慢，不是坏了。重试默认开，一共最多尝试 N 次
-    # （含第一轮），每轮的等待是上一轮的两倍：默认 3 次 = 120 / 240 / 480。
+    # （含第一轮），每轮的等待在上一轮基础上增加一个首轮时长：默认 3 次 = 120 / 240 / 360。
 
     def account_in(self, name, retry=None, timeout=None, attempts=None):
         """一个带自己 settings.json 的账号，方便按设置页的口径测重试策略。"""
@@ -311,7 +311,7 @@ class WebChannelTests(unittest.TestCase):
         self.assertEqual([t["wait_seconds"] for t in turns], [120, 240])
 
     def test_retries_stop_at_the_cap(self):
-        """一直跑不完就试到上限为止：默认一共 3 次，等待 120 / 240 / 480。"""
+        """一直跑不完就试到上限为止：默认一共 3 次，等待 120 / 240 / 360。"""
         acc = self.account_in("web-retry-cap", retry=True)
         _calls, fake = self.stub()
         turns = self.stub_turn({"ok": False, "status": "working", "chunks": 0,
@@ -324,7 +324,7 @@ class WebChannelTests(unittest.TestCase):
             wb_accounts.urlopen = old
         self.assertFalse(res.get("ok"), res)
         self.assertEqual(res.get("attempts"), wb_accounts.WEB_TURN_ATTEMPTS)
-        self.assertEqual([t["wait_seconds"] for t in turns], [120, 240, 480])
+        self.assertEqual([t["wait_seconds"] for t in turns], [120, 240, 360])
 
     def test_a_business_rejection_is_not_retried(self):
         """建会话被业务拒绝（非 0 code）时重试没有意义，只跑一轮。"""
@@ -368,7 +368,7 @@ class WebChannelTests(unittest.TestCase):
         self.assertEqual([t["wait_seconds"] for t in turns], [240])
 
     def test_a_fresh_install_retries_by_default(self):
-        """没碰过设置的安装就是默认口径：一共 3 次，等待 120 / 240 / 480。"""
+        """没碰过设置的安装就是默认口径：一共 3 次，等待 120 / 240 / 360。"""
         acc = self.account_in("web-retry-default")
         _calls, fake = self.stub()
         turns = self.stub_turn({"ok": False, "status": "working", "chunks": 0,
@@ -381,10 +381,10 @@ class WebChannelTests(unittest.TestCase):
             wb_accounts.urlopen = old
         self.assertFalse(res.get("ok"), res)
         self.assertEqual(res.get("attempts"), 3)
-        self.assertEqual([t["wait_seconds"] for t in turns], [120, 240, 480])
+        self.assertEqual([t["wait_seconds"] for t in turns], [120, 240, 360])
 
     def test_the_attempt_count_is_configurable(self):
-        """设置页改过的次数就是总次数（含第一轮）：5 次 = 120/240/480/960/1920。"""
+        """设置页改过的次数就是总次数（含第一轮）：5 次 = 120/240/360/480/600。"""
         acc = self.account_in("web-attempts", retry=True, attempts=5)
         _calls, fake = self.stub()
         turns = self.stub_turn({"ok": False, "status": "working", "chunks": 0,
@@ -396,7 +396,7 @@ class WebChannelTests(unittest.TestCase):
         finally:
             wb_accounts.urlopen = old
         self.assertEqual(res.get("attempts"), 5)
-        self.assertEqual([t["wait_seconds"] for t in turns], [120, 240, 480, 960, 1920])
+        self.assertEqual([t["wait_seconds"] for t in turns], [120, 240, 360, 480, 600])
 
     def test_one_attempt_means_one_try(self):
         """次数填 1 就是只跑一轮，与关掉开关等效。"""
@@ -430,7 +430,7 @@ class WebChannelTests(unittest.TestCase):
         self.assertEqual([t["wait_seconds"] for t in turns], [120])
 
     def test_the_configured_wait_is_the_first_attempt(self):
-        """设置页改过的等待时间就是首轮的等待，重试从它翻倍。"""
+        """设置页改过的等待时间就是首轮的等待，重试从它递增。"""
         acc = self.account_in("web-timeout", retry=True, timeout=45)
         _calls, fake = self.stub()
         turns = self.stub_turn(sequence=[{"ok": False, "status": "working", "chunks": 0},

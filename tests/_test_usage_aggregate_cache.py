@@ -1028,38 +1028,53 @@ check("写出来的还是完整的 checkpoint（每份自带 schema 与 kind 标
 # 空闲不重写（本节的靶子）：进度已对齐到 checkpoint，等满一个时间窗口后再
 # 刷新，日志没有新字节 → 不许再写。旧行为：计时器到点就无条件写一份逐字节
 # 相同的 checkpoint，面板开着等于每 900s 白写一份 120KB（纯写放大）。
-cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
-before = os.stat(KIND_FILES["snapshot"]).st_mtime_ns
-P._usage_cache_last_attempt -= 901
-live()
-check("计时器到点 + 无推进：不写（空闲不重写）",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
-# 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
-# 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
-P._usage_cache_last_attempt -= 901
-P.usage_snapshot(range="today", ttl=0)
-check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
-# 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
-append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
-P._usage_cache_last_attempt -= 901
-live()
-check("计时器到点 + 有新字节（不足字节阈值）：写一次",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns != before)
-write_log(ROWS)                          # 恢复基线日志，后续用例共用它
+#
+# 判据用写盘调用计数，不用文件时间或内容：exFAT 的 mtime 粒度粗，
+# 而一份内容相同的重写与「没有写」在文件上也看不出区别。
+snapshot_writes = []
+real_write_kind = P._usage_cache_write_kind
 
-# 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
-cache_env(enabled=1)                     # 默认阈值
-before = os.stat(KIND_FILES["snapshot"]).st_mtime_ns
-restart()
-live()
-check("重启加载后（默认阈值）不会重写一份内容相同的文件",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
-cache_env_off()
-clear_cache_files()
-restart()
-live()
-check("开关关闭 + 阈值全 0：仍然不写", no_cache_files())
+
+def counting_write_kind(kind, entries):
+    if kind == "snapshot":
+        snapshot_writes.append(entries)
+    return real_write_kind(kind, entries)
+
+
+P._usage_cache_write_kind = counting_write_kind
+try:
+    cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
+    P._usage_cache_last_attempt -= 901
+    live()
+    check("计时器到点 + 无推进：不写（空闲不重写）", snapshot_writes == [])
+    # 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
+    # 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
+    P._usage_cache_last_attempt -= 901
+    P.usage_snapshot(range="today", ttl=0)
+    check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
+          snapshot_writes == [])
+    # 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
+    append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
+    P._usage_cache_last_attempt -= 901
+    live()
+    check("计时器到点 + 有新字节（不足字节阈值）：写一次",
+          len(snapshot_writes) == 1)
+    write_log(ROWS)                          # 恢复基线日志，后续用例共用它
+
+    # 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
+    cache_env(enabled=1)                     # 默认阈值
+    snapshot_writes.clear()
+    restart()
+    live()
+    check("重启加载后（默认阈值）不会重写一份内容相同的文件",
+          snapshot_writes == [])
+    cache_env_off()
+    clear_cache_files()
+    restart()
+    live()
+    check("开关关闭 + 阈值全 0：仍然不写", no_cache_files())
+finally:
+    P._usage_cache_write_kind = real_write_kind
 
 print()
 print("[8] 幂等：同一份 checkpoint 只被采用一次")

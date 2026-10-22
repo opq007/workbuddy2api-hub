@@ -143,7 +143,8 @@ class RequestQueueTests(unittest.TestCase):
             with mock.patch.object(wb_update_request, "REQUEST_DIR", directory), \
                     mock.patch.object(wb_update_request, "REQUEST_FILE", request_path), \
                     mock.patch.object(wb_update_request, "STATUS_FILE", status_path), \
-                    mock.patch.object(wb_update_request, "install_enabled", return_value=True):
+                    mock.patch.object(wb_update_request, "install_enabled", return_value=True), \
+                    mock.patch.object(wb_update_request, "_systemd_enabled", return_value=True):
                 queued = wb_update_request.request_install("v1.7.13", "1.7.12")
                 with open(request_path, "r", encoding="utf-8") as fh:
                     saved = json.load(fh)

@@ -17,12 +17,18 @@ import wb_proxy
 
 
 class FakeAccount(object):
-    def __init__(self, uid, realm="intl", enabled=True, nickname=None):
+    def __init__(self, uid, realm="intl", enabled=True, nickname=None,
+                 tasks_enabled=None):
         self.uid = uid
         self.realm = realm
         self.enabled = enabled
+        self.tasks_enabled = (enabled if tasks_enabled is None
+                              else tasks_enabled)
         self.nickname = nickname
         self.calls = 0
+
+    def task_active(self):
+        return bool(self.tasks_enabled)
 
     def daily_chat(self, trigger="unknown"):
         self.calls += 1
@@ -38,6 +44,10 @@ class FakePool(object):
             if account.uid == uid:
                 return account
         return None
+
+    def task_accounts(self, realm=None):
+        return [a for a in self.accounts
+                if (not realm or a.realm == realm) and a.task_active()]
 
     def list_public(self, realm=None):
         return []
@@ -96,10 +106,17 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(body["results"], [])
         self.assertEqual(self.called(), [], "空名单不能被读成「全部账号」")
 
-    def test_without_a_list_every_enabled_intl_account_is_checked_in(self):
+    def test_without_a_list_every_task_enabled_intl_account_is_checked_in(self):
         body = self.call({})
         self.assertEqual([r["uid"] for r in body["results"]], ["i1", "i2", "i3"])
         self.assertEqual(self.called(), ["i1", "i2", "i3"])
+
+    def test_a_disabled_account_with_tasks_on_is_still_checked_in(self):
+        self.accounts.append(FakeAccount("i-task", enabled=False,
+                                         tasks_enabled=True))
+        body = self.call({})
+        self.assertIn("i-task", [r["uid"] for r in body["results"]])
+        self.assertIn("i-task", self.called())
 
     def test_a_single_uid_still_wins(self):
         body = self.call({"uid": "i3", "uids": ["i1"]})

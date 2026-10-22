@@ -12,6 +12,8 @@ import re
 import stat
 import time
 
+import wb_update_portable
+
 
 REQUEST_DIR = os.environ.get(
     "WB_UPDATE_REQUEST_DIR", "/run/workbuddy2api-hub-updater")
@@ -37,14 +39,37 @@ class UpdateRequestError(Exception):
     """A safe, user-visible reason an install request was refused."""
 
 
-def install_enabled():
-    """Only enable the panel action after the administrator installs its unit."""
+def _systemd_enabled():
+    """Only enable the systemd path after the administrator installs its unit."""
     return (
         str(os.environ.get("WB_UPDATE_INSTALL_ENABLED") or "").strip() == "1"
         and os.path.isdir(REQUEST_DIR)
         and os.path.exists(PATH_UNIT_FILE)
         and os.path.exists(ENABLED_UNIT_LINK)
     )
+
+
+def external_enabled():
+    """A deployment-provided executor polls request.json (issue #561).
+
+    The gateway still only writes a validated request; the executor is the
+    deployment's supervisor/entrypoint. Registration is either the
+    WB_UPDATE_EXECUTOR=external environment variable or an executor.json
+    marker in the request directory.
+    """
+    if str(os.environ.get("WB_UPDATE_INSTALL_ENABLED") or "").strip() != "1":
+        return False
+    if not os.path.isdir(REQUEST_DIR):
+        return False
+    mode = str(os.environ.get("WB_UPDATE_EXECUTOR") or "").strip().lower()
+    return (mode == "external"
+            or os.path.exists(os.path.join(REQUEST_DIR, "executor.json")))
+
+
+def install_enabled():
+    """The panel may install when either the unit or a portable package is here."""
+    return (_systemd_enabled() or external_enabled()
+            or wb_update_portable.available())
 
 
 def _version_tuple(tag):
@@ -87,8 +112,17 @@ def _read_root_status():
 
 
 def status():
-    result = {"install_enabled": install_enabled(),
-              "installation": _read_root_status()}
+    if _systemd_enabled() or external_enabled():
+        return _bridge_status()
+    if wb_update_portable.available():
+        return {"install_enabled": True,
+                "installation": wb_update_portable.status()}
+    return {"install_enabled": False,
+            "installation": {"state": "idle", "version": "", "message": ""}}
+
+
+def _bridge_status():
+    result = {"install_enabled": True, "installation": _read_root_status()}
     current = result["installation"]
     if (os.path.exists(REQUEST_FILE)
             and current.get("state") not in ACTIVE_STATES):
@@ -99,7 +133,7 @@ def status():
     return result
 
 
-def request_install(tag, current_version):
+def request_install(tag, current_version, port=8788, lan=False, repo=None):
     """Queue a stable tag for the root updater; caller must panel-authenticate."""
     if not install_enabled():
         raise UpdateRequestError("安装更新服务尚未配置")
@@ -107,6 +141,13 @@ def request_install(tag, current_version):
     current = _version_tuple("v" + str(current_version or "").strip().lstrip("v"))
     if target is None or current is None or target <= current:
         raise UpdateRequestError("目标版本无效或不高于当前版本")
+
+    if not _systemd_enabled() and not external_enabled():
+        try:
+            return wb_update_portable.request_install(
+                tag, current_version, port=port, lan=lan, repo=repo)
+        except wb_update_portable.UpdateError as exc:
+            raise UpdateRequestError(str(exc))
 
     existing = status()["installation"]
     if existing.get("state") in ACTIVE_STATES or os.path.exists(REQUEST_FILE):
@@ -116,6 +157,11 @@ def request_install(tag, current_version):
         "tag": tag,
         "version": "%d.%d.%d" % target,
         "requested_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        # The external executor needs to know which process to stop and
+        # which directory to replace; the systemd worker ignores extras.
+        "pid": os.getpid(),
+        "port": int(port),
+        "root": os.path.dirname(os.path.abspath(__file__)),
     }, separators=(",", ":")).encode("utf-8")
     flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
              | getattr(os, "O_CLOEXEC", 0) | _NOFOLLOW)

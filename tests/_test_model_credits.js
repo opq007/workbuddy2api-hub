@@ -113,4 +113,18 @@ check('a value without the x prefix is shown in the same format',
 cell = creditsCell({id: 'hy3', credits: 'X1.33'});
 check('an upper-case prefix is normalized too', cell.includes('1.33x'), cell);
 
+// 6. #505/#527: the entitlement label rides next to the multiplier, and the
+//    cell opts into wrapping so the second pill is not clipped.
+window.VIEW_REALM = 'intl';
+cell = creditsCell({id: 'gpt-6-astra', credits: 'x6.67',
+                    entitlement: {code: 11158, userType: 'personal_free_user',
+                                  checked_at: 1}});
+check('the entitlement label is rendered', cell.includes('免费账号不可用'), cell);
+check('the multiplier is still rendered', cell.includes('6.67x'), cell);
+check('the cell allows wrapping', /class="rate-cell"/.test(tbody.innerHTML),
+      tbody.innerHTML);
+cell = creditsCell({id: 'gpt-6-astra', credits: 'x6.67',
+                    entitlement: {code: 11102}});
+check('a non-11158 mark is not labelled', !cell.includes('免费账号不可用'), cell);
+
 console.log('model credits assertions passed (' + checks + ' checks)');

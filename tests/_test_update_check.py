@@ -458,6 +458,11 @@ class RouteTests(unittest.TestCase):
             self.payload = payload
             self.status = None
             self.reply = None
+            self.server = self._FakeServer()
+
+        class _FakeServer(object):
+            server_address = ("127.0.0.1", 8788)
+            server_port = 8788
 
         def _payload_or_error(self, allow_list=False):
             return self.payload
@@ -553,7 +558,10 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(request.status, 202)
             self.assertIs(request.reply["ok"], True)
             self.assertEqual(request.reply["version"], "1.6.18")
-            queue.assert_called_once_with("v1.6.18", CURRENT)
+            args, kwargs = queue.call_args
+            self.assertEqual(args, ("v1.6.18", CURRENT))
+            self.assertEqual(kwargs.get("port"), 8788)
+            self.assertFalse(kwargs.get("lan"))
 
     def test_manual_install_refuses_when_no_new_release_was_checked(self):
         with tempfile.TemporaryDirectory(prefix="upd-install-none-") as d:

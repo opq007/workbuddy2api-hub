@@ -297,6 +297,26 @@ class ManifestTests(unittest.TestCase):
             self.assertNotIn(name, listed)
 
 
+class VisibleLauncherTests(unittest.TestCase):
+    """Issue #559: the silent default stays, the console entry is opt-in."""
+
+    def test_wrappers_select_the_console_branch(self):
+        for wrapper, target in (
+                ("start-wb-proxy-visible.bat", "start-wb-proxy.bat"),
+                ("start-wb-proxy-lan-visible.bat", "start-wb-proxy-lan.bat")):
+            text = read(wrapper)
+            self.assertIn('set "WB_LAUNCH_MODE=console"', text)
+            self.assertIn('call "%~dp0' + target + '" %*', text)
+
+    def test_main_launchers_check_the_mode_before_pythonw(self):
+        for name in ("start-wb-proxy.bat", "start-wb-proxy-lan.bat"):
+            text = read(name)
+            mode = text.find('if /i "%WB_LAUNCH_MODE%"=="console" goto use_python')
+            pythonw = text.find("prefer pythonw")
+            self.assertGreaterEqual(mode, 0, name)
+            self.assertGreater(pythonw, mode, name)
+
+
 class RuntimeTrimTests(unittest.TestCase):
     """The trim rules reproduce the runtime the existing package ships."""
 
