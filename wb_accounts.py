@@ -68,6 +68,33 @@ class TLSVerifyError(RuntimeError):
     """The upstream certificate chain is not trusted by this process."""
 
 
+#: 上游拒绝建会话时会在 5xx 正文里带的特征串。这些不是抖动，是明确的
+#: 业务拒绝：同一个请求再发一次结果一样，不该重试。
+#:
+#: 已知形态（issue #558 实测）：
+#:   HTTP 500 {"code":10000,"msg":"CreateConversation: 10000:14284:AgentOS API
+#:   error: code=14220, msg=failed to create initial session"}
+#: 14220 = AgentOS 建不出初始 session；14284 = console API 层转发的子码。
+_WEB_REJECTION_MARKERS = (
+    "CreateConversation",
+    "AgentOS API error",
+    "failed to create initial session",
+    "code=14220",
+    "code=14284",
+)
+
+
+def _web_business_rejection(detail):
+    """上游正文是不是「明确拒绝」而不是临时故障？
+
+    上游把业务拒绝包在 5xx 里回（CreateConversation 被拒就是 HTTP 500），
+    光看状态码会把「拒绝」当成「抖动」而重试三次。重试既改不了结果，又
+    白耗建会话的配额，还把日志刷成三行看不懂的失败。
+    """
+    text = str(detail or "").lower()
+    return any(marker.lower() in text for marker in _WEB_REJECTION_MARKERS)
+
+
 TLS_VERIFY_HINT = (
     "TLS 证书校验失败：上游证书链里有本机不信任的证书。常见于公司代理、"
     "Clash/Surge 等 HTTPS 解密，或 macOS 上 Python 没读到系统钥匙串里的根证书。"
@@ -1909,17 +1936,34 @@ class Account(object):
         return not str(self.last_activity_report).startswith(today_str)
 
     def web_headers(self):
-        """网页版 app 的出站头：只有 bearer 与 X-User-Id，没有桌面端指纹。"""
-        return {
+        """网页版 app 的出站头：只有 bearer 与 X-User-Id，没有桌面端指纹。
+
+        网页版的其它调用（账号资料、成长任务领奖、计费明细）都带
+        `x-client-platform: web` 与 `X-Domain`，这里原来独缺这两个头。
+        少了它们，上游的渠道校验（AgentOS 侧的 CreateConversation）会把请求
+        当成「不是网页版发出来的」：建会话这一步直接失败，表现为
+        HTTP 500 / code 14220「failed to create initial session」。
+
+        Origin / Referer 按区域取：国际版 www.workbuddy.ai，国内版
+        www.workbuddy.cn（见 web_origin_for）。原来这里写死国际版，国内版账号
+        的网页请求带着另一个区域的 Origin，等于自报家门不一致。
+        """
+        origin = web_origin_for(self.realm)
+        headers = {
             "Authorization": "Bearer " + self.access_token,
             "X-User-Id": self.uid,
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "Origin": WEB_ORIGIN,
-            "Referer": WEB_ORIGIN + "/app",
+            "Origin": origin,
+            "Referer": origin + "/app",
             "User-Agent": WEB_USER_AGENT,
+            # 网页版平台标识：与账号资料 / 任务领奖那几条网页请求同款。
+            "x-client-platform": "web",
+            "X-Domain": origin,
         }
-
+        if getattr(self, "domain", ""):
+            headers["X-Domain"] = self.domain
+        return headers
     def daily_chat_model(self):
         """Which model this account's daily activity runs on.
 
@@ -2119,6 +2163,17 @@ class Account(object):
                 detail = exc.read().decode("utf-8", "replace")
             except Exception:
                 detail = str(exc)
+            # 上游的「拒绝」多半裹在 5xx 里：CreateConversation 被拒时上游回
+            # HTTP 500，正文是 {"code":10000,"msg":"CreateConversation: ...
+            # AgentOS API error: code=14220, msg=failed to create initial
+            # session"}。那不是抖动，是上游明确拒绝了这个请求——再发两次
+            # 结果一样，只是白耗三次建会话的配额，还把日志刷成三行。
+            # 只有「确实像临时故障」的错误才值得再试。
+            if _web_business_rejection(detail):
+                return {"ok": False,
+                        "error": "HTTP %d: %s" % (exc.code, detail[:120]),
+                        "retryable": False,
+                        "rejected": True}
             return {"ok": False, "error": "HTTP %d: %s" % (exc.code, detail[:120]),
                     "retryable": exc.code >= 500 or exc.code in (408, 429)}
         except Exception as exc:
@@ -2257,10 +2312,17 @@ class Account(object):
                     # 报成功的话，「今天这 30/50 积分没到账」在界面上一直看不见。
                     tries = res.get("attempts") or 1
                     suffix = "（已重试 %d 次）" % (tries - 1) if tries > 1 else ""
+                    # 上游明确拒绝时给出下一步该做什么，别只丢一串错误码。
+                    hint = ""
+                    if res.get("rejected"):
+                        hint = "；上游拒绝建会话（CreateConversation/14220）：" \
+                               "该账号当前不能建网页会话——换账号、稍后重试，" \
+                               "或先在浏览器里手动新建一次网页对话确认账号状态"
                     result["ok"] = False
-                    result["error"] = "网页通道失败：%s%s" % (res.get("error"), suffix)
-                    result["msg"] = "每日活跃对话未完成（网页通道失败：%s%s）" % (
-                        res.get("error"), suffix)
+                    result["error"] = "网页通道失败：%s%s%s" % (
+                        res.get("error"), suffix, hint)
+                    result["msg"] = "每日活跃对话未完成（网页通道失败：%s%s%s）" % (
+                        res.get("error"), suffix, hint)
             # 只有真正计入官方「每日活跃」的网页通道成功了才算今天做过：网页腿失败时
             # 若照写 lastDailyChat，当天后续巡检会直接跳过该账号，那天的 30/50 积分静默
             # 丢掉且不再重试。web=False（没开网页通道）时维持原语义：桌面腿成功即算完成。

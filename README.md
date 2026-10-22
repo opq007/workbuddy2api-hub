@@ -153,7 +153,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 206 个套件：154 个 Python + 52 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 207 个套件：155 个 Python + 52 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -461,6 +461,10 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 ### Unreleased
+
+- **网页通道建会话补齐网页版身份头（代理出口上的每日活跃报 14220 时先看这条）**：网页通道的出站头此前只有 bearer + `X-User-Id`，独缺网页版其它调用（账号资料、成长任务领奖、计费明细）都带的 `x-client-platform: web` 与 `X-Domain`——本仓库里唯一一处缺这两个头的网页版调用。上游的渠道校验会把「不像网页版发出来的」请求在建会话这一步拒掉，正文是 `CreateConversation: 10000:14284:AgentOS API error: code=14220, msg=failed to create initial session`。现已补齐，并把 `Origin` / `Referer` 改为按区域取（国内版账号不再带着国际版的 Origin 出门）。新增 11 项单测（`tests/_test_web_channel_proxy.py`）。 / The web channel now carries the same web-platform headers as the gateway's other web calls (`x-client-platform: web`, `X-Domain`), and its Origin / Referer follow the account's realm. The upstream channel check rejected a request that did not look like it came from the web app: HTTP 500 / code 14220 "failed to create initial session".
+- **沙箱那一跳支持 SOCKS 代理槽位**：网页通道的沙箱（ACP over HTTP + SSE）那一跳不走 `urlopen`，是裸 `http.client`，此前把 SOCKS 槽位当 HTTP 代理去发 CONNECT——SOCKS 服务器按 RFC 1928 校验首字节失败后直接 RST。表现是：建会话与取沙箱都成功，只有驱动沙箱那一跳连不上（`BadStatusLine`）。现按 scheme 分流，SOCKS 走 SOCKS 握手建隧道、域名交由代理端解析。修前沙箱跳根本没到源站（3 跳），修后全程经代理跑通（8 跳）。 / The ACP sandbox hop now dials through SOCKS instead of sending a CONNECT request to a SOCKS port.
+- **上游明确拒绝建会话时不再连打三次**：上游把「拒绝」包在 5xx 里回（`CreateConversation` → 14220），此前一律当成抖动重试满 3 次——结果一样，只是白耗三次建会话配额，还把日志刷成三行看不懂的失败。现识别出业务拒绝（`CreateConversation` / `AgentOS API error` / `code=14220` / `failed to create initial session`）并立即停手，失败说明里给出下一步（换账号、稍后重试，或先在浏览器里手动新建一次网页对话确认账号状态）；真抖动仍照旧重试。 / An upstream rejection (14220) is no longer retried three times; the failure now says what to do next.
 
 - **11-128：身份句渠道指纹的动词搭配补全**：v1.7.18 的正则只认 `agent powered by` / `assistant built on` 两种搭配，而同一判据下的 `built by`（如 `You are <Product> Agent, built by <Vendor>.`）、`created by` / `developed by` / `made by` / `trained by`，以及省略名词的 `You are powered by …` 都会漏检——上游只要补其中一条规则，这些句子就会重新命中 400 / 11-128。现按同一判据补全动词表：名词可省略、冠词后允许 0~3 个修饰词（专名 + 可选逗号）；`You are free to use tools built by …` 这类分词修饰宾语的句子保持不改写。新增 5 项断言（built by 变体、其余动词、省略名词、反误伤、角色作用域）。 / Broaden the identity-sentence channel fingerprint: v1.7.18 only matched `agent powered by` / `assistant built on`, so `built by` (`You are <Product> Agent, built by <Vendor>.`), `created by` / `developed by` / `made by` / `trained by`, and the noun-less `You are powered by …` slipped through — one rule added upstream would put them back on 400 / 11-128. The same rule now covers those verb forms, with an optional noun and up to three modifiers (proper names plus an optional comma), while participles modifying an object (`You are free to use tools built by …`) stay untouched. Five assertions added.
 - **网页活跃重试等待改为线性递增**：第 N 轮等待从「首轮 × 2^(N-1)」改为「首轮 × N」，默认 3 次从 120 / 240 / 480 秒变为 120 / 240 / 360 秒；最坏占用从指数级降到线性级。设置页说明同步更新。新增 4 项单测。 / The web-channel retry wait now grows linearly: round N waits base × N instead of base × 2^(N-1), so the default three tries are 120 / 240 / 360 seconds instead of 120 / 240 / 480. The worst case is linear rather than exponential. Covered by 4 new tests.

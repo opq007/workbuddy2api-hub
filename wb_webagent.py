@@ -19,6 +19,7 @@ import base64
 import http.client
 import json
 import queue
+import ssl
 import threading
 import time
 import urllib.parse
@@ -30,6 +31,25 @@ CLIENT_CAPABILITIES = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
 }
+
+#: 账号配了 SOCKS 槽位时用这个 scheme 判定（与 wb_accounts._SOCKS_SCHEME_RE 同口径）。
+_SOCKS_SCHEME_PREFIXES = ("socks5", "socks5h", "socks4", "socks4a", "socks4h", "socks")
+
+
+def is_socks_proxy(proxy_url):
+    """这个代理串是不是 SOCKS（而不是 HTTP 代理）？
+
+    沙箱那一跳不走 urllib 的 opener（那是别的模块的私有实现），所以这里要
+    自己认一次 scheme：HTTP 代理走 CONNECT 隧道，SOCKS 走 SOCKS 握手。
+    """
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return False
+    scheme = raw.split("://", 1)[0].strip().lower() if "://" in raw else ""
+    if not scheme:
+        # 无 scheme 的写法按 HTTP 代理处理（与 urllib 一致）。
+        return False
+    return scheme in _SOCKS_SCHEME_PREFIXES
 
 
 def _proxy_parts(proxy_url):
@@ -70,6 +90,35 @@ class AcpError(Exception):
     """驱动失败时抛这个（调用方转成可读的错误文本）。"""
 
 
+class _SocksTunnelConnection(http.client.HTTPConnection):
+    """A connection whose TCP socket is dialled through a SOCKS proxy.
+
+    The ACP sandbox hop is the one place in the web channel that does not go
+    through ``wb_accounts.urlopen`` (it is a raw http.client stream), so it
+    needs its own SOCKS support: handing a SOCKS URL to ``set_tunnel`` sends a
+    CONNECT request to a SOCKS port, which fails the RFC 1928 handshake.
+
+    The dial itself lives in ``wb_accounts`` (it already implements RFC 1928
+    for the console-API hops); it is imported lazily because wb_accounts
+    imports this module.
+    """
+
+    def __init__(self, proxy_url, host, port, https=False, timeout=30):
+        super().__init__(host, port, timeout=timeout)
+        self._proxy_url = proxy_url
+        self._https = https
+
+    def connect(self):
+        import wb_accounts
+        spec = wb_accounts._parse_socks_proxy(self._proxy_url)
+        sock = wb_accounts._socks_dial(spec, self.host, self.port, self.timeout)
+        if self._https:
+            context = ssl.create_default_context()
+            self.sock = context.wrap_socket(sock, server_hostname=self.host)
+        else:
+            self.sock = sock
+
+
 class AcpChannel(object):
     """ACP 的 streamable-HTTP 传输：一条 SSE 收事件，POST 发请求。"""
 
@@ -101,7 +150,17 @@ class AcpChannel(object):
         cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         conn = cls(parsed.hostname, port, timeout=self.timeout)
         if self.proxy:
-            # 账号配了代理时走 CONNECT，和 urlopen 那条路径保持一致。
+            if is_socks_proxy(self.proxy):
+                # SOCKS 槽位：不能拿它当 HTTP 代理去 CONNECT —— 那会把 CONNECT
+                # 文本直接发给 SOCKS 端口，握手必然失败（网页通道的 console API
+                # 那几跳走 wb_accounts.urlopen，能用 SOCKS；沙箱这一跳是裸
+                # http.client，不走那条路，于是只有这一跳断，表现为沙箱连不上）。
+                # 这里改成 SOCKS 握手建隧道，域名交由代理端解析。
+                conn = _SocksTunnelConnection(
+                    self.proxy, parsed.hostname, port,
+                    https=(parsed.scheme == "https"), timeout=self.timeout)
+                return conn
+            # 账号配了 HTTP 代理时走 CONNECT，和 urlopen 那条路径保持一致。
             # 凭据必须显式塞进 CONNECT：urllib 的 ProxyHandler 会替我们加
             # Proxy-Authorization，裸 http.client + set_tunnel 不会，缺了它
             # 认证代理一律回 407（桌面通道正常、网页通道 407 就是这个原因）。
