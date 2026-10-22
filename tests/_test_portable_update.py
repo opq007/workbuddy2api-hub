@@ -175,7 +175,7 @@ class ApplyTests(unittest.TestCase):
                     mock.patch.object(U, "stop_gateway", lambda pid: None), \
                     mock.patch.object(U, "wait_port_free", lambda port: True), \
                     mock.patch.object(U, "start_service", lambda *a: None), \
-                    mock.patch.object(U, "wait_health", lambda port: True):
+                    mock.patch.object(U, "wait_health", lambda port, **kw: True):
                 code = U.run_update(root, package, "v2.0.0", "2.0.0",
                                     8788, False, 1234, "o/r")
             self.assertEqual(code, 0)
@@ -192,7 +192,7 @@ class ApplyTests(unittest.TestCase):
                     mock.patch.object(U, "stop_gateway", lambda pid: None), \
                     mock.patch.object(U, "wait_port_free", lambda port: True), \
                     mock.patch.object(U, "start_service", lambda *a: None), \
-                    mock.patch.object(U, "wait_health", lambda port: False):
+                    mock.patch.object(U, "wait_health", lambda port, **kw: False):
                 code = U.run_update(root, package, "v2.0.0", "2.0.0",
                                     8788, False, 1234, "o/r")
             self.assertEqual(code, 1)

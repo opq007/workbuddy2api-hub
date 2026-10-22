@@ -15,10 +15,11 @@ import re
 import stat
 import sys
 
-from wb_update_portable import (UpdateError, _write_status,
-                                recover_incomplete, run_update)
+from wb_update_portable import (UpdateError, _write_status, keep_backups_setting,
+                                recover_incomplete, run_rollback, run_update)
 
 TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+ACTIONS = ("install", "rollback")
 
 
 def read_request(path):
@@ -58,6 +59,8 @@ def main(argv=None):
                                                "/run/workbuddy2api-hub-updater"))
     parser.add_argument("--repo", default=os.environ.get("WB_UPDATE_REPO", ""))
     parser.add_argument("--root", default=os.environ.get("WB_APP_ROOT", "/app"))
+    # -1 = read the panel's setting from the app's own settings.json.
+    parser.add_argument("--keep-backups", type=int, default=-1)
     args = parser.parse_args(argv)
     request_file = os.path.join(args.request_dir, "request.json")
     status_file = os.path.join(args.request_dir, "status.json")
@@ -73,8 +76,17 @@ def main(argv=None):
         return 0
     try:
         payload = read_request(request_file)
+        action = str(payload.get("action") or "install").strip().lower()
+        if action not in ACTIONS:
+            raise UpdateError("更新请求动作无效")
         tag = str(payload.get("tag") or "")
         version = str(payload.get("version") or "")
+        if action == "rollback":
+            # A rollback only needs the version to restore; the tag is carried
+            # so that an older executor treats the same request as "reinstall
+            # that tag" instead of refusing it (see wb_update_request).
+            if not tag:
+                tag = "v" + version
         match = TAG_RE.fullmatch(tag)
         if not match or version != "%d.%d.%d" % tuple(int(x) for x in match.groups()):
             raise UpdateError("更新请求版本无效")
@@ -93,16 +105,23 @@ def main(argv=None):
             pass
         print("update request rejected: %s" % exc, file=sys.stderr)
         return 1
+    keep = args.keep_backups
+    if keep < 0:
+        keep = keep_backups_setting(root)
     try:
+        if action == "rollback":
+            return run_rollback(root, root, version, port, pid,
+                                status_file=status_file,
+                                start_service_fn=None, keep_backups=keep)
         return run_update(root, root, tag, version, port, False, pid,
                           args.repo, status_file=status_file,
-                          start_service_fn=None)
+                          start_service_fn=None, keep_backups=keep)
     except Exception as exc:
         try:
             _write_status("failed", version, str(exc)[:200], path=status_file)
         except Exception:
             pass
-        print("update failed: %s" % exc, file=sys.stderr)
+        print("%s failed: %s" % (action, exc), file=sys.stderr)
         return 1
 
 

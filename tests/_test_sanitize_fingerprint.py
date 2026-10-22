@@ -127,6 +127,81 @@ class DshHarnessChannelFingerprintTests(unittest.TestCase):
         self.assertEqual(out[4]["content"], self.FP)
 
 
+class DshGuiParagraphTests(unittest.TestCase):
+    """DSH 系统提示里 GUI 描述段的渠道指纹（#570）。
+
+    A 句 + B 句连续出现即命中 11-128；实测改 A 句、改 B 句、或在两句之间插东西都会
+    失配。这里只调整 A 句尾的语序，一个词都不删——`DeepSeek Harness` 全名保留，
+    句子意思不变。规则锚定整句，句子之外的同名品牌仍按「只改已确认连续指纹」的
+    既有口径保持原样。
+    """
+
+    A = ('You are interacting with the user through the DeepSeek Harness Web GUI '
+         'whose URL the runtime context names.')
+    A_REWORDED = ('You are interacting with the user through the DeepSeek Harness Web GUI '
+                  'whose URL is named in the runtime context.')
+    B = ('When the user refers to "this page", "this GUI", or "this app" without naming '
+         'another target, they mean this GUI.')
+    GUI = A + " " + B
+
+    def test_gui_paragraph_in_system_reworded(self):
+        out = P.sanitize_messages([{"role": "system", "content": self.GUI}])
+        self.assertEqual(out[0]["content"], self.A_REWORDED + " " + self.B)
+
+    def test_brand_survives_the_rewrite(self):
+        # 这是本规则的核心取舍：只动语序，不动品牌。
+        out = P.sanitize_text(self.GUI)
+        self.assertIn("DeepSeek Harness Web GUI", out)
+        self.assertNotIn("whose URL the runtime context names", out)
+
+    def test_gui_paragraph_in_developer_reworded(self):
+        out = P.sanitize_messages([{"role": "developer", "content": self.GUI}])
+        self.assertEqual(out[0]["content"], self.A_REWORDED + " " + self.B)
+
+    def test_user_and_tool_untouched(self):
+        out = P.sanitize_messages([
+            {"role": "user", "content": self.GUI},
+            {"role": "tool", "content": self.GUI},
+        ])
+        self.assertEqual(out[0]["content"], self.GUI)
+        self.assertEqual(out[1]["content"], self.GUI)
+
+    def test_brand_outside_the_sentence_untouched(self):
+        # 锚定整句的意义：句子之外的同名品牌不属于已确认指纹，不能顺手改写。
+        for text in ("DeepSeek Harness",
+                     "the DeepSeek Harness project",
+                     "You are interacting with the user through the DeepSeek Harness CLI."):
+            self.assertEqual(P.sanitize_text(text), text, text)
+
+    def test_hyphenated_identifiers_untouched(self):
+        # 路径 / 包名 / 仓库地址里的连字符形式必须原样保留。
+        for text in (
+            "github.com/deepseek-ai/deepseek-harness/tree/main",
+            "import deepseek_harness as dsh",
+            "/opt/deepseek-harness/app",
+        ):
+            self.assertEqual(P.sanitize_text(text), text, text)
+
+    def test_case_insensitive_and_idempotent(self):
+        out = P.sanitize_text(self.GUI.lower())
+        self.assertEqual(
+            out,
+            self.GUI.lower().replace("whose url the runtime context names",
+                                     "whose URL is named in the runtime context"))
+        self.assertEqual(P.sanitize_text(out), out)
+
+    def test_wire_body_carries_the_rewrite(self):
+        # 走完整链路再断言一次：规则接上了还不够，得确认 build_upstream_body
+        # 真的用它构造出站 body（漏接时单测全绿、线上照旧 400）。
+        body = P.build_upstream_body({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "system", "content": self.GUI},
+                         {"role": "user", "content": "hi"}]})
+        system = body["messages"][0]["content"]
+        self.assertIn("DeepSeek Harness Web GUI", system)
+        self.assertIn("whose URL is named in the runtime context", system)
+
+
 class IdentityVerbVariantsTests(unittest.TestCase):
     """同类自述句的其它动词搭配（built by / created by / …）与省略名词的形态。
 

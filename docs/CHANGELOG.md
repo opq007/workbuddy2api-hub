@@ -1,3 +1,12 @@
+## v1.7.25
+
+四笔社区改动：DSH GUI 指纹、跨出口回退、账号表排序续行、更新备份与版本回退。套件 208 个（155 Python + 53 JS）。
+
+- **11-128：DSH GUI 描述段的句尾语序**（#579）：国内版 system 提示里的 GUI 描述段 `… the DeepSeek Harness Web GUI whose URL the runtime context names.` 紧跟 `When the user refers to "this page" …` 会命中 11-128；现在只把 A 句尾改成 `whose URL is named in the runtime context.`，品牌名与句意不变，作用域仍是 system / developer。新增 8 项断言。
+- **跨出口回退：国际版限流 → 国内版（默认关闭）**（#564）：国际版整池被限流 / 24h 窗口用满 / 整池冷却 / 空池时，把同一请求在同名国内版出口重放一次；只对两边都提供的模型、单向、显式指定 realm 的请求不回退，403 11140 不重放。设置页新增开关。新增 16 项单测。
+- **修复账号表排序把冷却 / 达限胶囊拆离账号行**（#568）：`applyTableSort()` 现在按「主行 + 紧跟的 `tr.cool-row` 续行」成组排序；表头列类型推断仍只看数据行。新增 JS 断言。
+- **保留历史版本备份 + 面板版本回退**（#571）：更新成功后保留 `updates/backup-<目标版本>/`，份数由设置控制（0–3，默认 1；0 = 不留备份、回退不可用）。设置页新增「版本回退」卡片，按本地备份恢复、不下载旧包；回退前校验完整性，回退后校验 `Server: wb-proxy/<版本>`，失败自动恢复到回退前版本。`request.json` 新增 `action`（`install` / `rollback`），便携版、外部执行者与 systemd 服务都认；旧执行者会把 rollback 当「重装该 tag」。新增 26 项 Python 断言与 1 个 JS 套件。
+
 ## v1.7.24
 
 非 systemd 部署的面板一键更新通道（#561）：`install_enabled()` 不再只认 systemd unit；部署方可以用外部执行者轮询 `request.json`，网关仍只写请求、不碰自己的代码。套件 205 个（153 Python + 52 JS）。

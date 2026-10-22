@@ -48,6 +48,14 @@ CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
 SECTION_MAX_HEIGHT_KEY = "section_max_height"
 DEFAULT_SECTION_MAX_HEIGHT = 640
 MAX_SECTION_MAX_HEIGHT = 4000
+# How many app-layer backups a successful update keeps under <app>/updates.
+# Rollback works off those backups, so 0 means "no rollback at all"; 1 is the
+# default because it is enough to undo one step and each backup is a few MB.
+# Capped at 3: the app layer is ~5 MB per copy and the container's rootfs is
+# small, so an unbounded value is a foot-gun rather than a feature.
+KEEP_BACKUPS_KEY = "keep_backups"
+DEFAULT_KEEP_BACKUPS = 1
+MAX_KEEP_BACKUPS = 3
 # Whether a model name may inherit its price from a suffix-stripped base
 # (deepseek-r1-0528-lkeap → deepseek-r1-0528). Missing key reads as on.
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
@@ -113,6 +121,13 @@ REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 # 计数，改记在出口上、退避降到秒级（见 wb_egress）。缺失键读作关：它改变的是
 # 派发路径上的失败归账与退避尺度，老安装保持原样（传输错误仍喂账号熔断）。
 EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
+
+# 跨出口回退（国际版 → 国内版）：国际版出口把某个模型限流 / 当日额度用满 /
+# 整池冷却时，允许拿同名的国内版出口再试一次。缺失键读作关 —— 两个出口是两套
+# 上游、两套额度、两套积分口径，混用会让「这个 Key 只花国际额度」的部署失去
+# 保证，所以老安装保持出口严格隔离（realm 一次定死，账号池按 realm 过滤）。
+# 打开后方向仍是单向的：只有 intl → cn，永远不会把请求从国内版打到国际版。
+REALM_FALLBACK_ENABLED_KEY = "realm_fallback_enabled"
 
 # 日志落库：把运行日志追加写进 usage/logs.sqlite3，重启后仍能回看，方便事后
 # debug。缺失键读作关 —— 关着的时候日志只留在内存环形缓冲里，与上游一字不差；
@@ -966,6 +981,39 @@ def set_credits_refresh_hours(accounts_dir, value):
     return hours
 
 
+def keep_backups(accounts_dir):
+    """How many update backups to retain, 0-3.
+
+    Read by the update path after every success (prune) and by the panel before
+    it offers a rollback, so a missing or hand-edited value must never be
+    something the callers have to guard: anything that is not an int reads as
+    the default, and the result is always inside 0..MAX_KEEP_BACKUPS.
+    """
+    with _lock:
+        raw = load(accounts_dir).get(KEEP_BACKUPS_KEY)
+    if raw is None or isinstance(raw, bool):
+        return DEFAULT_KEEP_BACKUPS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_KEEP_BACKUPS
+    return max(0, min(MAX_KEEP_BACKUPS, value))
+
+
+def set_keep_backups(accounts_dir, value):
+    """Persist the backup retention count. Returns the stored value."""
+    try:
+        keep = int(value)
+    except (TypeError, ValueError):
+        keep = DEFAULT_KEEP_BACKUPS
+    keep = max(0, min(MAX_KEEP_BACKUPS, keep))
+    with _lock:
+        data = load(accounts_dir)
+        data[KEEP_BACKUPS_KEY] = keep
+        save(accounts_dir, data)
+    return keep
+
+
 #: 后台排程时段（CST 24 小时制）。默认值与旧版硬编码完全一致，老安装行为不变。
 DEFAULT_SCHEDULE_HOURS = {
     "checkin": [9, 21],
@@ -1814,6 +1862,40 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data[EGRESS_BACKOFF_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def realm_fallback_enabled(accounts_dir):
+    """Whether a throttled international exit may fail over to the domestic one.
+
+    Off unless the operator turns it on, because it crosses a boundary the
+    gateway otherwise keeps absolute: an account belongs to one exit, and the
+    pool only ever dispatches that exit's accounts (see AccountPool.pick). The
+    two exits are separate upstreams with separate quota and separate credit
+    ledgers, so serving a request from the other one changes which balance was
+    spent.
+
+    It is still worth having: the exits throttle independently. When every
+    international account is cooling a model - upstream frequency limit, a used
+    up 24h window, or the gateway's own synthesized "usage exceeds frequency
+    limit" - the domestic exit can usually serve the same model right away,
+    because it is a different host with its own rate limiter.
+
+    The direction is deliberately one-way (intl -> cn). A request that started
+    on the domestic exit never fails over to the international one: domestic
+    accounts are the cheaper/free side, and silently moving traffic onto the
+    international exit would spend a balance the operator did not ask to spend.
+    """
+    return load(accounts_dir).get(REALM_FALLBACK_ENABLED_KEY) is True
+
+
+def set_realm_fallback_enabled(accounts_dir, enabled):
+    """Persist the cross-exit fallback switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[REALM_FALLBACK_ENABLED_KEY] = enabled
         save(accounts_dir, data)
     return enabled
 

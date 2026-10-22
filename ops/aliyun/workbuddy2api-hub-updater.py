@@ -41,6 +41,13 @@ LOCK_FILE = "/run/lock/workbuddy2api-hub-updater.lock"
 BACKUP_ROOT = "/var/backups/workbuddy2api-hub"
 STAGE_ROOT = "/var/tmp/workbuddy2api-hub-updater"
 USER_AGENT = "workbuddy2api-hub-manual-updater"
+#: Inventory of retained backups, published next to status.json so the
+#: unprivileged gateway (and the panel behind it) can offer a rollback without
+#: being able to read BACKUP_ROOT.
+INVENTORY_FILE = os.path.join(REQUEST_DIR, "backups.json")
+BACKUP_META = "backup-meta.json"
+DEFAULT_KEEP_BACKUPS = 1
+MAX_KEEP_BACKUPS = 3
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 CHECKSUM_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
@@ -93,18 +100,14 @@ def _wbproxy_ids():
     return entry.pw_uid, entry.pw_gid
 
 
-def _set_status(state, version="", message=""):
-    payload = {
-        "state": state,
-        "version": str(version or "")[:32],
-        "message": str(message or "")[:240],
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-    }
+def _write_shared_json(path, payload):
+    """Atomically publish a root-written file the wbproxy group may read."""
     blob = (json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             + "\n").encode("utf-8")
     uid = 0
     _wbproxy_uid, gid = _wbproxy_ids()
-    tmp = os.path.join(REQUEST_DIR, ".status-%d-%d.tmp" % (os.getpid(), time.time_ns()))
+    tmp = os.path.join(REQUEST_DIR, ".%s-%d-%d.tmp"
+                       % (os.path.basename(path), os.getpid(), time.time_ns()))
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(tmp, flags, 0o640)
     try:
@@ -116,12 +119,21 @@ def _set_status(state, version="", message=""):
             os.fsync(stream.fileno())
     finally:
         os.close(fd)
-    os.replace(tmp, STATUS_FILE)
+    os.replace(tmp, path)
     dir_fd = os.open(REQUEST_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+def _set_status(state, version="", message=""):
+    _write_shared_json(STATUS_FILE, {
+        "state": state,
+        "version": str(version or "")[:32],
+        "message": str(message or "")[:240],
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    })
 
 
 def _safe_exception(exc):
@@ -158,12 +170,17 @@ def _read_request():
 
     if not isinstance(payload, dict):
         raise UpdateError("更新请求格式无效")
+    action = payload.get("action")
+    if action is None:
+        action = "install"
+    if action not in ("install", "rollback"):
+        raise UpdateError("更新请求动作无效")
     tag = payload.get("tag")
     version = payload.get("version")
     parsed = _version_tuple(tag)
     if parsed is None or version != "%d.%d.%d" % parsed:
         raise UpdateError("更新请求版本无效")
-    return {"tag": tag, "version": version}
+    return {"action": action, "tag": tag, "version": version}
 
 
 def _fetch(url, limit, timeout=30):
@@ -512,6 +529,116 @@ def _restore_changes(files, existed, backup_dir, group_id):
                 pass
 
 
+def _backup_meta_path(backup_dir):
+    return os.path.join(backup_dir, BACKUP_META)
+
+
+def _write_backup_meta(backup_dir, version):
+    """Record what a retained backup restores.
+
+    The folder name is a timestamp, so without this file a later run cannot tell
+    which release a backup holds - and the panel could not offer it. Written
+    right after restore-state.json, i.e. before anything is replaced.
+    """
+    payload = {
+        "version": str(version),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+    path = _backup_meta_path(backup_dir)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+        fh.write("\n")
+    os.chmod(path, 0o600)
+    return payload
+
+
+def _list_local_backups():
+    """Every retained backup, newest first, as the panel needs to see it.
+
+    Complete means: restore-state.json parses and every file it says existed is
+    still inside the folder. A half-written backup must never be offered - it
+    would put a mixed tree in place.
+    """
+    try:
+        names = sorted(os.listdir(BACKUP_ROOT), reverse=True)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        path = os.path.join(BACKUP_ROOT, name)
+        if not name.startswith("backup-") or not os.path.isdir(path):
+            continue
+        try:
+            with open(_backup_meta_path(path), encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            meta = None
+        version = str((meta or {}).get("version") or "")
+        if _version_tuple("v" + version) is None:
+            continue
+        complete, reason, files = True, "", 0
+        try:
+            with open(os.path.join(path, "restore-state.json"), encoding="utf-8") as fh:
+                existed = json.load(fh)
+            if not isinstance(existed, dict):
+                raise ValueError("restore-state")
+            files = len(existed)
+            for rel, present in existed.items():
+                if not present:
+                    continue
+                if not os.path.isfile(os.path.join(path, "app", *rel.split("/"))):
+                    complete, reason = False, "备份缺少文件 %s" % rel
+                    break
+        except (OSError, ValueError, TypeError):
+            complete, reason = False, "备份缺少可解析的 restore-state.json"
+        out.append({
+            "version": version,
+            "created_at": str((meta or {}).get("created_at") or "")[:32],
+            "files": files,
+            "complete": complete,
+            "reason": reason,
+            "_dir": path,
+        })
+    return out
+
+
+def _keep_backups_setting():
+    """The panel's retention count, read from the app's own settings.json."""
+    try:
+        with open(os.path.join(APP_DIR, "accounts", "settings.json"),
+                  "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        value = data.get("keep_backups") if isinstance(data, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int):
+            return DEFAULT_KEEP_BACKUPS
+        return max(0, min(MAX_KEEP_BACKUPS, value))
+    except (OSError, ValueError, TypeError):
+        return DEFAULT_KEEP_BACKUPS
+
+
+def _prune_backups(keep):
+    """Drop backups beyond `keep` (0 removes them all). Returns removed versions."""
+    removed = []
+    for entry in _list_local_backups()[keep:]:
+        shutil.rmtree(entry["_dir"], ignore_errors=True)
+        removed.append(entry["version"])
+    return removed
+
+
+def _write_inventory():
+    """Publish the backup list where the unprivileged gateway can read it.
+
+    The folders live under a root-only directory, so the panel cannot list them
+    itself; this file is the only channel (0640 root:wbproxy, like status.json).
+    """
+    entries = [{key: value for key, value in entry.items() if not key.startswith("_")}
+               for entry in _list_local_backups()]
+    _write_shared_json(INVENTORY_FILE, {
+        "backups": entries,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    })
+
+
 def _systemctl(*args, timeout=60):
     try:
         result = subprocess.run(["/bin/systemctl"] + list(args),
@@ -546,12 +673,24 @@ def _do_update(request_data):
     if getattr(os, "geteuid", lambda: -1)() != 0:
         raise UpdateError("更新服务必须由 systemd 管理员服务运行")
     repo = _repo()
+    action = str(request_data.get("action") or "install")
     tag = request_data["tag"]
     target_version = request_data["version"]
     target_tuple = _version_tuple(tag)
     current_version = _current_version()
     current_tuple = tuple(int(value) for value in current_version.split("."))
-    if target_tuple is None or target_tuple <= current_tuple:
+    if target_tuple is None:
+        raise UpdateError("目标版本无效或不高于当前版本")
+    if action == "rollback":
+        # A rollback reinstalls an older release, so "must be newer" cannot
+        # apply here. What it must be instead: a version this host actually kept
+        # a backup of, which is exactly the list the panel offered.
+        if target_version == current_version:
+            raise UpdateError("回退目标与当前版本相同")
+        if not any(entry["version"] == target_version and entry["complete"]
+                   for entry in _list_local_backups()):
+            raise UpdateError("没有可回退到 %s 的本地备份" % target_version)
+    elif target_tuple <= current_tuple:
         raise UpdateError("目标版本无效或不高于当前版本")
 
     os.makedirs(BACKUP_ROOT, mode=0o700, exist_ok=True)
@@ -588,6 +727,9 @@ def _do_update(request_data):
             json.dump(existed, fh, ensure_ascii=False, separators=(",", ":"))
             fh.write("\n")
         os.chmod(os.path.join(backup_dir, "restore-state.json"), 0o600)
+        # Which release this folder restores: the panel needs it to offer the
+        # backup at all, and a later rollback request is checked against it.
+        _write_backup_meta(backup_dir, current_version)
 
         _set_status("stopping", target_version, "正在停止网关")
         stopped = True
@@ -604,8 +746,19 @@ def _do_update(request_data):
         if not _health_check():
             raise UpdateError("更新后网关健康检查未通过")
         stopped = False
-        _set_status("succeeded", target_version, "更新完成；账号与用量目录保持原样")
-        _log("installed stable release %s; backup=%s" % (target_version, backup_dir))
+        if action == "rollback":
+            _set_status("restored", target_version, "已回退到 %s" % target_version)
+        else:
+            _set_status("succeeded", target_version, "更新完成；账号与用量目录保持原样")
+        _log("%s %s; backup=%s"
+             % ("rolled back to" if action == "rollback" else "installed stable release",
+                target_version, backup_dir))
+        # Retention is the panel's setting; pruning and the inventory are what
+        # keeps the rollback list honest after every successful run.
+        try:
+            _prune_backups(_keep_backups_setting())
+        except OSError:
+            pass
     except Exception as exc:
         message = _safe_exception(exc)
         if stopped and existed is not None:
@@ -631,6 +784,12 @@ def _do_update(request_data):
         raise
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
+        # Publish what is on disk now, whatever the outcome: a failed run may
+        # have added a backup, and the panel's list must match reality.
+        try:
+            _write_inventory()
+        except Exception as exc:
+            _log("could not publish the backup inventory: %s" % _safe_exception(exc))
 
 
 def main():
@@ -663,8 +822,16 @@ def main():
     try:
         request_data = _read_request()
         if request_data is None:
+            # No request: the only thing worth doing is keeping the panel's
+            # backup list in step with what is on disk.
+            try:
+                _write_inventory()
+            except Exception as exc:
+                _log("could not publish the backup inventory: %s" % _safe_exception(exc))
             return 0
-        _set_status("queued", request_data["version"], "更新任务已排队")
+        _set_status("queued", request_data["version"],
+                    "回退任务已排队" if request_data.get("action") == "rollback"
+                    else "更新任务已排队")
         try:
             _do_update(request_data)
             return 0
